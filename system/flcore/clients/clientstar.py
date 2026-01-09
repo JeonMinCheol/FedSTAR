@@ -1,7 +1,6 @@
 import time
 from collections import defaultdict
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,12 +100,81 @@ class clientstar(Client):
             nn.Linear(4*D, D//4), nn.GELU(),
             nn.Linear(D//4, 1)
         ).to(self.device)
+
+    def extract_features_for_retrieval(self, num_samples=20):
+        """
+        [분석 타겟 변경 버전]
+        - Feature (z): model.base(x) [Raw Feature]
+        - Target (g): model.head.weight [실제 분류기가 학습한 클래스 중심]
+        """
+        self.model.eval()
+        self.model.to(self.device)
+        
+        trainloader = self.load_train_data(batch_size=num_samples)
+        
+        extracted_data = []
+        count = 0
+        eps = 1e-6
+
+        with torch.no_grad():
+            # 1. Head의 Weight를 정규화하여 준비 (이것이 진정한 Local Prototype)
+            # shape: [Num_Classes, D]
+            head_weights = F.normalize(self.model.head.weight, p=2, dim=1)
+
+            for x, y in trainloader:
+                if count >= num_samples: break
+
+                x = x.to(self.device)
+                y = y.to(self.device)
+                
+                # 2. Raw Feature 추출
+                reps = self.model.base(x) # [B, D]
+                
+                # Feature도 정규화 (코사인 유사도 기반 분해를 위해 필수)
+                reps_norm = F.normalize(reps, p=2, dim=1)
+
+                for i in range(len(y)):
+                    if count >= num_samples: break
+                        
+                    label = int(y[i].item())
+                    
+                    # z: 정규화된 Feature
+                    z = reps_norm[i] 
+                    
+                    # g: 해당 클래스의 Head Weight (모델이 생각하는 정답 방향)
+                    # 만약 Head가 Bias가 있다면 Bias는 무시하고 방향성만 봅니다.
+                    if label < head_weights.shape[0]:
+                        g = head_weights[label] 
+                        
+                        # -------------------------------------------------
+                        # 3. Orthogonal Decomposition (변경 없음)
+                        # -------------------------------------------------
+                        # 이미 둘 다 정규화(norm=1) 되었으므로 dot_gg = 1
+                        dot_zg = torch.dot(z, g) # 이것이 코사인 유사도
+                        
+                        # Content: g 방향 성분
+                        content_vec = dot_zg * g
+                        
+                        # Style: g와 수직인 성분 (Residual)
+                        style_vec = z - content_vec
+                        
+                        # 분석을 위해 Numpy 변환
+                        # (분석 함수에서 다시 normalize 하더라도 여기서 값을 살려둠)
+                        extracted_data.append({
+                            "client_id": self.id,
+                            "label": label,
+                            "content": content_vec.cpu().numpy(),
+                            "style": style_vec.cpu().numpy()
+                        })
+                        count += 1
+        
+        return extracted_data
     
-    def _merge_personalized(self, g, p):
+    def _merge_alpha(self, g, p):
         g, p = g.view(1,-1), p.view(1,-1)
         z = torch.cat([g, p, (g-p).abs(), g*p], dim=-1)
         alpha = torch.sigmoid(self.alpha_gate(z))  # [1,1]
-        return alpha * g + (1 - alpha) * p
+        return alpha
 
     def _get_proto_for_label(self, y_label: int):
         """
@@ -179,7 +247,6 @@ class clientstar(Client):
                         mask_s = y_mapped_s >= 0
                         
                         if mask_s.any():
-                            # 이것이 model.base를 직접 정렬하는 '공유 로스'
                             shared_loss = self.criterion_ce(plogits_s[mask_s], y_mapped_s[mask_s])
 
                 # -----------------------------------------------------------
@@ -267,9 +334,7 @@ class clientstar(Client):
             g = self.global_protos[lbl].to(self.device)
             p = self.local_personal_protos[lbl].to(self.device)
 
-            # 변경한 부분 cosine simillarity -> 게이팅
-            alpha = self._merge_personalized(g,p)
-
+            alpha = self._merge_alpha(g,p)
             personalized = alpha * g + (1 - alpha) * p
             self.personalized_protos[lbl] = personalized.detach().cpu()
 
