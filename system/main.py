@@ -10,15 +10,13 @@ import torchvision
 import logging
 
 from flcore.servers.servermtl import FedMTL
-from flcore.servers.serverapfl import APFL
 from flcore.servers.serverditto import Ditto
 from flcore.servers.serverrep import FedRep
 from flcore.servers.serverproto import FedProto
-from flcore.servers.servermoon import MOON
 from flcore.servers.serverala import FedALA
-from flcore.servers.serverlg import LG_FedAvg
 from flcore.servers.serverstar import FedSTAR
-from flcore.servers.serverablation import ablation
+from flcore.servers.serverpac import FedPAC
+from flcore.servers.servertgp import FedTGP
 
 from flcore.trainmodel.models import *
 
@@ -28,8 +26,8 @@ from flcore.trainmodel.alexnet import *
 from flcore.trainmodel.mobilenet_v2 import *
 from flcore.trainmodel.mobilenet_v3 import *
 from flcore.trainmodel.transformer import *
-# from utils.mem_utils import MemReporter
 
+from utils.mem_utils import MemReporter
 
 logger = logging.getLogger()
 logger.setLevel(logging.ERROR)
@@ -43,7 +41,7 @@ emb_dim=32
 
 def run(args):
     time_list = []
-    # reporter = MemReporter()
+    reporter = MemReporter()
     model_str = args.model
 
     for i in range(args.prev, args.times):
@@ -154,23 +152,17 @@ def run(args):
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedSTAR(args, i)
 
-        elif args.algorithm == "ablation":
-            args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
-            server = ablation(args, i)
-
         elif args.algorithm == "FedMTL":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedMTL(args, i)
 
-        elif args.algorithm == "APFL":
+        elif args.algorithm == "FedTGP":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
-            server = APFL(args, i)
+            server = FedTGP(args, i)
 
         elif args.algorithm == "Ditto":
             args.head = copy.deepcopy(args.model.fc)
@@ -190,23 +182,17 @@ def run(args):
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedProto(args, i)
 
-        elif args.algorithm == "MOON":
-            args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
-            server = MOON(args, i)
-
         elif args.algorithm == "FedALA":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedALA(args, i)
 
-        elif args.algorithm == "LG-FedAvg":
+        elif args.algorithm == "FedPAC":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
-            server = LG_FedAvg(args, i)
+            server = FedPAC(args, i)
             
         else:
             raise NotImplementedError
@@ -216,14 +202,9 @@ def run(args):
         time_list.append(time.time()-start)
 
     print(f"\nAverage time cost: {round(np.average(time_list), 2)}s.")
-    
-
-    # Global average
-    # average_data(dataset=args.dataset, algorithm=args.algorithm, goal=args.goal, times=args.times)
-
     print("All done!")
 
-    # reporter.report()
+    reporter.report()
 
 
 if __name__ == "__main__":
@@ -233,7 +214,8 @@ if __name__ == "__main__":
     # general
     parser.add_argument('-go', "--goal", type=str, default="test", 
                         help="The goal for this experiment")
-    parser.add_argument('-dcl', "--dirchlet", type=float, default=0.1, 
+    parser.add_argument('-seed', "--random_seed", type=int, default=1234)
+    parser.add_argument('-dcl', "--dirchlet", type=float, default=1.0, 
                         help="dirchlet value")
     parser.add_argument('-nw', "--num_workers", type=int, default=0)
     parser.add_argument('-dev', "--device", type=str, default="cuda",
@@ -248,7 +230,7 @@ if __name__ == "__main__":
     parser.add_argument('-ld', "--learning_rate_decay", type=bool, default=False)
     parser.add_argument('-ldg', "--learning_rate_decay_gamma", type=float, default=0.99)
     parser.add_argument('-gr', "--global_rounds", type=int, default=200)
-    parser.add_argument('-ls', "--local_epochs", type=int, default=5, 
+    parser.add_argument('-ls', "--local_epochs", type=int, default=3, 
                         help="Multiple update steps in one local epoch.")
     parser.add_argument('-algo', "--algorithm", type=str, default="FedAvg")
     parser.add_argument('-jr', "--join_ratio", type=float, default=1.0,
@@ -266,7 +248,7 @@ if __name__ == "__main__":
     parser.add_argument('-dp', "--privacy", type=bool, default=False,
                         help="differential privacy")
     parser.add_argument('-dps', "--dp_sigma", type=float, default=0.0)
-    parser.add_argument('-sfn', "--save_folder_name", type=str, default='items')
+    parser.add_argument('-sfn', "--save_folder_name", type=str, default='temp')
     parser.add_argument('-ab', "--auto_break", type=bool, default=False)
     parser.add_argument('-dlg', "--dlg_eval", type=bool, default=False)
     parser.add_argument('-dlgg', "--dlg_gap", type=int, default=100)
@@ -293,21 +275,29 @@ if __name__ == "__main__":
     # FedMTL
     parser.add_argument('-itk', "--itk", type=int, default=4000,
                         help="The iterations for solving quadratic subproblems")
+    # FedBABU
+    parser.add_argument('-fts', "--fine_tuning_steps", type=int, default=10)
     # APFL
     parser.add_argument('-al', "--alpha", type=float, default=1.0)
     # Ditto / FedRep
     parser.add_argument('-pls', "--plocal_steps", type=int, default=5)
     parser.add_argument('-dmu', "--ditto_mu", type=int, default=1)
-    # MOON
-    parser.add_argument('-tau', "--tau", type=float, default=1.0)
     # FedALA
     parser.add_argument('-et', "--eta", type=float, default=1)
     parser.add_argument('-s', "--rand_percent", type=int, default=80)
-    parser.add_argument('-p', "--layer_idx", type=int, default=4,
+    parser.add_argument('-p', "--layer_idx", type=int, default=-1,
                         help="More fine-graind than its original paper.")
+    # FedTGP
+    parser.add_argument('-mart', "--margin_threthold", type=float, default=100.0)
+    parser.add_argument('-se', "--server_epochs", type=int, default=1000)
     # FedSTAR
-    parser.add_argument('-lps', "--lambda_proto_shared", type=float, default=1.0)
-    parser.add_argument('-lpp', "--lambda_proto_pull", type=float, default=0.1)
+    parser.add_argument('-dr', "--dropout", type=float, default=0.05)
+    parser.add_argument('-uf', "--use_film", type=bool, default=False)
+    parser.add_argument('-ut', "--use_transformer", type=bool, default=False)
+    parser.add_argument('-udg', "--use_decompose_with_global", type=bool, default=False)
+    parser.add_argument('-sas', "--server_agg_steps", type=int, default=5)
+    parser.add_argument('-sac', "--server_agg_clip", type=float, default=1.0)
+    parser.add_argument('-alr', "--aggregator_learning_rate", type=float, default=0.005)
 
     args = parser.parse_args()
 
@@ -323,41 +313,48 @@ if __name__ == "__main__":
     print("Dataset: {}".format(args.dataset))
     print("Local batch size: {}".format(args.batch_size))
     print("Local steps: {}".format(args.local_epochs))
-    print("Local learing rate: {}".format(args.local_learning_rate))
-    print("Local learing rate decay: {}".format(args.learning_rate_decay))
+    # print("Local learing rate decay: {}".format(args.learning_rate_decay))
     if args.learning_rate_decay:
         print("Local learing rate decay gamma: {}".format(args.learning_rate_decay_gamma))
     print("Total number of clients: {}".format(args.num_clients))
     print("Clients join in each round: {}".format(args.join_ratio))
-    print("Clients randomly join: {}".format(args.random_join_ratio))
-    print("Client drop rate: {}".format(args.client_drop_rate))
-    print("Client select regarding time: {}".format(args.time_select))
+    # print("Clients randomly join: {}".format(args.random_join_ratio))
+    # print("Client drop rate: {}".format(args.client_drop_rate))
+    # print("Client select regarding time: {}".format(args.time_select))
     if args.time_select:
         print("Time threthold: {}".format(args.time_threthold))
-    print("Running times: {}".format(args.times))
+    # print("Running times: {}".format(args.times))
     print("Number of classes: {}".format(args.num_classes))
     print("Backbone: {}".format(args.model))
     print("Using device: {}".format(args.device))
-    print("Using DP: {}".format(args.privacy))
 
     if args.privacy:
         print("Sigma for DP: {}".format(args.dp_sigma))
-    print("Auto break: {}".format(args.auto_break))
+    # print("Auto break: {}".format(args.auto_break))
 
     if not args.auto_break:
         print("Global rounds: {}".format(args.global_rounds))
 
     if args.device == "cuda":
         print("Cuda device id: {}".format(os.environ["CUDA_VISIBLE_DEVICES"]))
-    print("DLG attack: {}".format(args.dlg_eval))
+    # print("DLG attack: {}".format(args.dlg_eval))
     
     if args.dlg_eval:
         print("DLG attack round gap: {}".format(args.dlg_gap))
-    print("Total number of new clients: {}".format(args.num_new_clients))
-    print("Fine tuning epoches on new clients: {}".format(args.fine_tuning_epoch))
-    print("Dirchlet rate: {}".format(args.dirchlet))
-    print("lambda_proto_shared: {}".format(args.lambda_proto_shared))
-    print("lambda_proto_pull: {}".format(args.lambda_proto_pull))
+    # print("Total number of new clients: {}".format(args.num_new_clients))
+    # print("Fine tuning epoches on new clients: {}".format(args.fine_tuning_epoch))
+    # print("Dirchlet rate: {}".format(args.dirchlet))
+    
+    if args.algorithm == "FedSTAR":
+        print("use_film: {}".format(args.use_film))
+        print("use_transformer: {}".format(args.use_transformer))
+        print("use_decompose_with_global: {}".format(args.use_decompose_with_global))
+        print("server_agg_steps: {}".format(args.server_agg_steps))
+        print("server_agg_clip: {}".format(args.server_agg_clip))
+        print("Aggregator Dropout: {}".format(args.dropout))
+        print("aggregator_learning_rate: {}".format(args.aggregator_learning_rate))
+
+    print("Local learing rate: {}".format(args.local_learning_rate))
     print("=" * 50)
 
     run(args)
