@@ -189,7 +189,7 @@ class clientstar(Client):
                 z_norm = F.normalize(reps_personalized, dim=1)
                 align_loss = (1 - (z_norm * p_mixed).sum(dim=1)).mean()
 
-                total_loss = ce_loss # + align_loss 
+                total_loss = ce_loss + align_loss 
 
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
