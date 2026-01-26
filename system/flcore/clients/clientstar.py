@@ -8,9 +8,6 @@ import torch.nn.functional as F
 import numpy as np
 from flcore.clients.clientbase import Client
 
-# ----------------------------------------------------------------------------
-# 1. 보조 모듈 (StyleFiLM, ClientPrototypeGenerator) - 그대로 유지
-# ----------------------------------------------------------------------------
 class StyleFiLM(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
@@ -97,13 +94,11 @@ class clientstar(Client):
              self.proto_gen.norm = nn.LayerNorm(self.embed_dim).to(self.device)
              self.proto_gen.personal_table = nn.Parameter(torch.zeros(self.num_classes, self.embed_dim).to(self.device))
 
-        # 🎛️ [Conditional Init] FiLM 모듈 조건부 생성
         if self.use_film:
             self.film = StyleFiLM(self.embed_dim).to(self.device)
         else:
             self.film = None
 
-        # 🎛️ [Optimizer] FiLM 파라미터 조건부 등록
         optim_params = [
             {'params': self.model.parameters(), 'lr': self.learning_rate},
             {'params': self.proto_gen.parameters(), 'lr': self.learning_rate * 10}
@@ -145,8 +140,7 @@ class clientstar(Client):
                     reps_raw = self.model(mixed_x)
                 reps_raw = reps_raw.view(reps_raw.size(0), -1)
                 
-                # 🎛️ [Conditional Logic] FiLM 적용 여부 확인
-                reps_personalized = reps_raw # 기본값 (Bypass)
+                reps_personalized = reps_raw 
                 
                 # 1. 스위치가 켜져 있고(use_film)
                 # 2. 로컬 스타일 정보가 존재할 때만 실행
@@ -402,7 +396,6 @@ class clientstar(Client):
                 else: features_raw = self.model(x)
                 features_raw = features_raw.view(features_raw.size(0), -1)
                 
-                # 🎛️ [Conditional Logic] FiLM 적용 여부 확인 (Test Time)
                 features_film = features_raw # 기본값
                 
                 if self.use_film and hasattr(self, "local_style") and self.local_style:
