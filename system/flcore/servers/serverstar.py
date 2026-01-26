@@ -1,3 +1,4 @@
+# fedstar_server.py
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -124,12 +125,17 @@ def _linear_probe(X, y, name="probe", test_size=0.25, seed=0):
 def _linear_probe_balanced(
     X, y,
     name="probe",
-    min_per_class=2,      
-    max_classes=50,       
-    per_class_cap=50,     
+    min_per_class=2,      # 이 이상 샘플 있는 클래스만 사용
+    max_classes=50,       # 너무 많으면 probe가 무거우니 제한
+    per_class_cap=50,     # 클래스당 최대 샘플수 제한
     test_size=0.25,
     seed=0,
 ):
+    """
+    - y에서 count >= min_per_class 클래스만 유지
+    - 클래스별로 per_class_cap까지 균등 샘플링
+    - 남은 클래스가 2개 미만이면 probe 스킵
+    """
     y = np.asarray(y)
     counts = Counter(y.tolist())
     valid = [c for c, n in counts.items() if n >= min_per_class]
@@ -137,6 +143,7 @@ def _linear_probe_balanced(
         print(f"[Probe:{name}] skipped (valid classes < 2 after min_per_class={min_per_class}).")
         return None, None
 
+    # 클래스 너무 많으면 상위(샘플 많은) 클래스만
     valid = sorted(valid, key=lambda c: counts[c], reverse=True)[:max_classes]
 
     # balanced indices
@@ -151,6 +158,7 @@ def _linear_probe_balanced(
     Xb = X[idx]
     yb = y[idx]
 
+    # 이제 stratify 가능 (모든 클래스 count >= 2 보장됨)
     try:
         Xtr, Xte, ytr, yte = train_test_split(
             Xb, yb, test_size=test_size, random_state=seed, stratify=yb
@@ -182,7 +190,7 @@ def run_disentanglement_analysis_head_only(
 
     # 1) Collect
     db = []
-    target_total = 240      
+    target_total = 240          # 최소 200 넘기려고 여유 있게
     per_client = max(40, target_total // max(1, len(clients)))
 
     db = []
@@ -279,7 +287,6 @@ def run_disentanglement_analysis_head_only(
 
     return out
 
-
 # =========================================================
 # Server-side prototype aggregator (Transformer)
 # =========================================================
@@ -371,6 +378,7 @@ class FedSTAR(Server):
             self.agg_opt = None
             print("[*] Aggregation Mode: Simple Average")
 
+        # CPU oversubscription 방지
         torch.set_num_threads(1)
         self.max_parallel_clients = 6
 
@@ -510,6 +518,7 @@ class FedSTAR(Server):
                 new_protos = {}
                 for lbl, p_list in temp_storage.items():
                     # [N, 1, D] -> [N, D] -> mean -> [D] -> [1, D]
+                    # 단순 평균 (Simple Average)
                     mean_proto = torch.cat(p_list, dim=0).mean(dim=0, keepdim=True)
                     new_protos[lbl] = mean_proto.cpu()
                 
@@ -523,6 +532,8 @@ class FedSTAR(Server):
             dt = time.time() - start_time
             print(f"Time: {dt:.2f}s")
 
+            # 서버가 가지고 있는 Global Prototypes (dict 형태)
+            # 예: server.global_protos 
             # print("--- Final Disentanglement Analysis (HEAD-ONLY improved) ---")
             # stats = run_disentanglement_analysis_head_only(
             #     selected_clients,
