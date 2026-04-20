@@ -4,7 +4,7 @@ import torch
 
 def read_data(dataset, idx, is_train=True, alpha=0.1):
     if is_train:
-        train_data_dir = os.path.join('/local_datasets/a2019102224/', dataset, 'train/')
+        train_data_dir = os.path.join('../dataset/', dataset, 'train/')
 
         train_file = train_data_dir + str(idx) + '_' + str(alpha) + '.npz'
         with open(train_file, 'rb') as f:
@@ -13,7 +13,7 @@ def read_data(dataset, idx, is_train=True, alpha=0.1):
         return train_data
 
     else:
-        test_data_dir = os.path.join('/local_datasets/a2019102224/', dataset, 'test/')
+        test_data_dir = os.path.join('../dataset/', dataset, 'test/')
 
         test_file = test_data_dir + str(idx) + '_' + str(alpha) + '.npz'
         with open(test_file, 'rb') as f:

@@ -22,7 +22,7 @@ def safe_auc(y_true, y_prob):
 
 def safe_f1(y_true, y_pred):
     try:
-        return metrics.f1_score(y_true, y_pred, average='weighted')
+        return metrics.f1_score(y_true, y_pred, average='macro')
     except Exception:
         return 0.0
 
@@ -33,6 +33,46 @@ def brier_score(y_true, y_prob):
         return np.mean(np.sum((y_prob - y_true) ** 2, axis=1))
     except Exception:
         return np.nan
+
+
+def multiclass_ece(y_true, y_prob, n_bins=10):
+    """
+    Top-label expected calibration error for multi-class classification.
+    y_true can be integer labels [N] or one-hot labels [N, C].
+    y_prob is expected to be class probabilities [N, C].
+    """
+    try:
+        y_prob = np.asarray(y_prob)
+        y_true = np.asarray(y_true)
+        if y_prob.ndim != 2 or y_prob.shape[0] == 0:
+            return 0.0
+
+        if y_true.ndim == 2:
+            y_true = np.argmax(y_true, axis=1)
+        else:
+            y_true = y_true.astype(np.int64)
+
+        confidences = np.max(y_prob, axis=1)
+        predictions = np.argmax(y_prob, axis=1)
+        correctness = (predictions == y_true).astype(np.float64)
+
+        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+        ece = 0.0
+        for bin_idx in range(n_bins):
+            left = bin_edges[bin_idx]
+            right = bin_edges[bin_idx + 1]
+            if bin_idx == 0:
+                mask = (confidences >= left) & (confidences <= right)
+            else:
+                mask = (confidences > left) & (confidences <= right)
+            if not np.any(mask):
+                continue
+            acc_bin = np.mean(correctness[mask])
+            conf_bin = np.mean(confidences[mask])
+            ece += (np.sum(mask) / len(confidences)) * abs(acc_bin - conf_bin)
+        return float(ece)
+    except Exception:
+        return 0.0
 
 class Server(object):
     def __init__(self, args, times):
@@ -53,6 +93,7 @@ class Server(object):
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
         self.random_join_ratio = args.random_join_ratio
+        self.random_seed = int(getattr(args, "random_seed", 0))
         self.num_join_clients = int(self.num_clients * self.join_ratio)
         self.current_num_join_clients = self.num_join_clients
         self.algorithm = args.algorithm
@@ -137,7 +178,7 @@ class Server(object):
             self.send_slow_rate)
 
     def select_clients(self):
-        rnd = np.random.RandomState(seed=42 + self.current_round)  # 내부 상태 기반 시드
+        rnd = np.random.RandomState(seed=self.random_seed + 42 + self.current_round)
 
         if self.random_join_ratio:
             self.current_num_join_clients = rnd.choice(
@@ -354,7 +395,7 @@ class Server(object):
             return self.test_metrics_new_clients()
 
         all_y_prob, all_y_true = [], []
-        client_aucs, client_accs, client_fscores = [], [], []
+        client_aucs, client_accs, client_fscores, client_eces = [], [], [], []
 
         global_num = 0
         global_correct = 0
@@ -379,9 +420,11 @@ class Server(object):
             y_pred_c = np.argmax(y_prob_c, axis=1)
             y_true_label = np.argmax(y_true_c, axis=1)
             f1_i = safe_f1(y_true_label, y_pred_c)
+            ece_i = multiclass_ece(y_true_label, y_prob_c)
 
             client_aucs.append(auc_i)
             client_fscores.append(f1_i)
+            client_eces.append(ece_i)
             all_y_true.append(y_true_c)
             all_y_prob.append(y_prob_c)
 
@@ -396,33 +439,11 @@ class Server(object):
         acc_std = float(np.std(client_accs)) if client_accs else 0.0
         auc_std = float(np.std(client_aucs)) if client_aucs else 0.0
         f1_std = float(np.std(client_fscores)) if client_fscores else 0.0
-
-        # --- ECE 계산 ---
-        ece_list, ece_error = [], []
-        n_classes = all_y_true.shape[1] if all_y_true.ndim == 2 else 1
-        bins = np.linspace(0.0, 1.0, 11)
-
-        for c in range(n_classes):
-            probs = all_y_prob[:, c]
-            trues = all_y_true[:, c]
-            bin_ids = np.digitize(probs, bins) - 1
-            ece_c = 0.0
-            for i in range(10):
-                mask = (bin_ids == i)
-                if np.sum(mask) == 0:
-                    continue
-                acc_bin = np.mean(trues[mask])
-                conf_bin = np.mean(probs[mask])
-                err = abs(acc_bin - conf_bin)
-                ece_c += (np.sum(mask) / len(probs)) * err
-                ece_error.append(err)
-            ece_list.append(ece_c)
-
-        global_ece_mean = float(np.mean(ece_list))
-        ece_std = float(np.std(ece_error)) if ece_error else 0.0
+        ece_std = float(np.std(client_eces)) if client_eces else 0.0
         global_acc = global_correct / max(global_num, 1)
         global_auc = safe_auc(all_y_true, all_y_prob)
         global_fscore = safe_f1(y_true_all, y_pred_all)
+        global_ece_mean = multiclass_ece(y_true_all, all_y_prob)
 
         # --- 추가 metric ---
         global_brier = brier_score(all_y_true, all_y_prob)
@@ -459,8 +480,6 @@ class Server(object):
             print("Averaged Test AUC: {:.4f}".format(test_auc))
             print("Averaged Test F1: {:.4f}".format(test_fscore))
             print("Averaged Test ECE: {:.4f}".format(test_ece))
-            print("Std (Acc/AUC/F1/ECE): {:.4f}, {:.4f}, {:.4f}, {:.4f}".format(
-                acc_std, auc_std, f1_std, ece_std))
 
         # 추가 요약
         if hasattr(self, "analysis_dict"):
@@ -500,11 +519,9 @@ class Server(object):
         # --- 3. CSV 헤더 (한 번만 생성) ---
         header = [
             "round","train_loss","train_acc","test_acc","test_auc","test_fscore","test_ece",
-            "acc_std","auc_std","f1_std","ece_std",
-            "confusion_matrix_diag_mean","confusion_matrix_offdiag_mean",
-            "precision_mean","precision_std","precision_min","precision_max",
-            "recall_mean","recall_std","recall_min","recall_max",
-            "f1_class_mean","f1_class_std","f1_class_min","f1_class_max",
+            "precision_mean",
+            "recall_mean",
+            "f1_class_mean",
             "brier_score","entropy"
         ]
         
@@ -516,26 +533,20 @@ class Server(object):
 
         # --- 4. 분석 데이터 ---
         a = self.analysis_dict
-        cm = a.get("confusion_matrix", np.zeros((2, 2)))
         precision = a.get("precision", np.zeros(1))
         recall = a.get("recall", np.zeros(1))
         f1_class = a.get("f1_class", np.zeros(1))
         brier = a.get("brier_score", 0.0)
         entropy_v = a.get("entropy", 0.0)
 
-        cm_diag_mean = float(np.mean(np.diag(cm))) if cm.size > 0 else 0.0
-        cm_offdiag_mean = float(np.mean(cm[~np.eye(cm.shape[0], dtype=bool)])) if cm.size > 0 else 0.0
-
         # --- 5. 한 줄 데이터 ---
         row = [
             rnd,
             f"{train_loss:.4f}", f"{train_acc:.4f}",
             f"{test_acc:.4f}", f"{test_auc:.4f}", f"{test_fscore:.4f}", f"{test_ece:.4f}",
-            f"{acc_std:.4f}", f"{auc_std:.4f}", f"{f1_std:.4f}", f"{ece_std:.4f}",
-            f"{cm_diag_mean:.4f}", f"{cm_offdiag_mean:.4f}",
-            f"{np.mean(precision):.4f}", f"{np.std(precision):.4f}", f"{np.min(precision):.4f}", f"{np.max(precision):.4f}",
-            f"{np.mean(recall):.4f}", f"{np.std(recall):.4f}", f"{np.min(recall):.4f}", f"{np.max(recall):.4f}",
-            f"{np.mean(f1_class):.4f}", f"{np.std(f1_class):.4f}", f"{np.min(f1_class):.4f}", f"{np.max(f1_class):.4f}",
+            f"{np.mean(precision):.4f}",
+            f"{np.mean(recall):.4f}",
+            f"{np.mean(f1_class):.4f}",
             f"{float(brier):.4f}", f"{float(entropy_v):.4f}",
         ]
 

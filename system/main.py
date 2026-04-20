@@ -3,10 +3,10 @@ import copy
 import torch
 import argparse
 import os
+import random
 import time
 import warnings
 import numpy as np
-import torchvision
 import logging
 
 from flcore.servers.servermtl import FedMTL
@@ -19,6 +19,7 @@ from flcore.servers.serverpac import FedPAC
 from flcore.servers.servertgp import FedTGP
 
 from flcore.trainmodel.models import *
+from flcore.trainmodel.fedstar_model import build_fedstar_model, parse_client_model_names
 
 from flcore.trainmodel.bilstm import *
 from flcore.trainmodel.resnet import *
@@ -39,18 +40,61 @@ vocab_size = 98635
 max_len=200
 emb_dim=32
 
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {"true", "1", "yes", "y", "t"}:
+        return True
+    if value in {"false", "0", "no", "n", "f"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Cannot interpret boolean value: {value}")
+
+
+def set_random_seed(seed: int, deterministic: bool = True):
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+
 def run(args):
     time_list = []
     reporter = MemReporter()
     model_str = args.model
+    fedstar_client_backbones = None
+    fedstar_bootstrap_model = model_str
+
+    if args.algorithm == "FedSTAR":
+        fedstar_client_backbones = parse_client_model_names(
+            client_models=args.client_models,
+            num_clients=args.num_clients,
+            default_model=model_str,
+        )
+        args.client_backbones = fedstar_client_backbones
+        fedstar_bootstrap_model = fedstar_client_backbones[0]
 
     for i in range(args.prev, args.times):
         print(f"\n============= Running time: {i}th =============")
         print("Creating server and clients ...")
         start = time.time()
+        active_model_str = fedstar_bootstrap_model if args.algorithm == "FedSTAR" else model_str
+        args.model_factory = None
 
         # Generate args.model
-        if model_str == "mlr": # convex
+        if active_model_str == "mlr": # convex
             if "mnist" in args.dataset:
                 args.model = Mclr_Logistic(1*28*28, num_classes=args.num_classes).to(args.device)
             elif "Cifar10" in args.dataset:
@@ -58,10 +102,10 @@ def run(args):
             else:
                 args.model = Mclr_Logistic(60, num_classes=args.num_classes).to(args.device)
                 
-        elif model_str == "fmnist": # non-convex
+        elif active_model_str == "fmnist": # non-convex
             args.model = FashionCNNModel().to(args.device)
 
-        elif model_str == "cnn": # non-convex
+        elif active_model_str == "cnn": # non-convex
             if "mnist" in args.dataset:
                 args.model = FedAvgCNN(in_features=1, num_classes=args.num_classes, dim=1024).to(args.device)
             elif "Cifar10" in args.dataset:
@@ -75,7 +119,7 @@ def run(args):
             elif "office" in args.dataset:
                 args.model = FedAvgCNN(in_features=3, num_classes=args.num_classes, dim=379456).to(args.device)
 
-        elif model_str == "dnn": # non-convex
+        elif active_model_str == "dnn": # non-convex
             if "mnist" in args.dataset:
                 args.model = DNN(1*28*28, 100, num_classes=args.num_classes).to(args.device)
             elif "Cifar10" in args.dataset:
@@ -83,7 +127,8 @@ def run(args):
             else:
                 args.model = DNN(60, 20, num_classes=args.num_classes).to(args.device)
         
-        elif model_str == "resnet":
+        elif active_model_str == "resnet":
+            import torchvision
             args.model = torchvision.models.resnet18(pretrained=False, num_classes=args.num_classes).to(args.device)
             
             # args.model = torchvision.models.resnet18(pretrained=True).to(args.device)
@@ -92,49 +137,50 @@ def run(args):
             
             # args.model = resnet18(num_classes=args.num_classes, has_bn=True, bn_block_num=4).to(args.device)
 
-        elif model_str == "alexnet":
+        elif active_model_str == "alexnet":
             args.model = alexnet(pretrained=False, num_classes=args.num_classes).to(args.device)
             
             # args.model = alexnet(pretrained=True).to(args.device)
             # feature_dim = list(args.model.fc.parameters())[0].shape[1]
             # args.model.fc = nn.Linear(feature_dim, args.num_classes).to(args.device)
             
-        elif model_str == "googlenet":
+        elif active_model_str == "googlenet":
+            import torchvision
             args.model = torchvision.models.googlenet(pretrained=False, aux_logits=False, num_classes=args.num_classes).to(args.device)
             
             # args.model = torchvision.models.googlenet(pretrained=True, aux_logits=False).to(args.device)
             # feature_dim = list(args.model.fc.parameters())[0].shape[1]
             # args.model.fc = nn.Linear(feature_dim, args.num_classes).to(args.device)
 
-        elif model_str == "mobilenet_v2":
+        elif active_model_str == "mobilenet_v2":
             args.model = mobilenet_v2(pretrained=False, num_classes=args.num_classes).to(args.device)
         
-        elif model_str == "mobilenet_v3":
+        elif active_model_str == "mobilenet_v3":
             args.model = mobilenet_v3_ultralite(pretrained=False, num_classes=args.num_classes).to(args.device)
 
-        elif model_str == "lstm":
+        elif active_model_str == "lstm":
             args.model = LSTMNet(hidden_dim=emb_dim, vocab_size=vocab_size, num_classes=args.num_classes).to(args.device)
 
-        elif model_str == "bilstm":
+        elif active_model_str == "bilstm":
             args.model = BiLSTM_TextClassification(input_size=vocab_size, hidden_size=emb_dim, output_size=args.num_classes, 
                         num_layers=1, embedding_dropout=0, lstm_dropout=0, attention_dropout=0, 
                         embedding_length=emb_dim).to(args.device)
 
-        elif model_str == "fastText":
+        elif active_model_str == "fastText":
             args.model = fastText(hidden_dim=emb_dim, vocab_size=vocab_size, num_classes=args.num_classes).to(args.device)
 
-        elif model_str == "TextCNN":
+        elif active_model_str == "TextCNN":
             args.model = TextCNN(hidden_dim=emb_dim, max_len=max_len, vocab_size=vocab_size, 
                             num_classes=args.num_classes).to(args.device)
 
-        elif model_str == "Transformer":
+        elif active_model_str == "Transformer":
             args.model = TransformerModel(ntoken=vocab_size, d_model=emb_dim, nhead=8, d_hid=emb_dim, nlayers=2, 
                             num_classes=args.num_classes).to(args.device)
         
-        elif model_str == "AmazonMLP":
+        elif active_model_str == "AmazonMLP":
             args.model = AmazonMLP().to(args.device)
 
-        elif model_str == "harcnn":
+        elif active_model_str == "harcnn":
             if args.dataset == 'har':
                 args.model = HARCNN(9, dim_hidden=1664, num_classes=args.num_classes, conv_kernel_size=(1, 9), pool_kernel_size=(1, 2)).to(args.device)
             elif args.dataset == 'pamap':
@@ -147,9 +193,29 @@ def run(args):
 
         # select algorithm
         if args.algorithm == "FedSTAR":
-            args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            def fedstar_model_factory(
+                client_id,
+                backbones=tuple(fedstar_client_backbones),
+                dataset=args.dataset,
+                num_classes=args.num_classes,
+                shared_dim=args.shared_dim,
+                private_dim=args.private_dim,
+                use_private_branch=args.use_private_branch,
+                shared_classifier_scale=args.shared_classifier_scale,
+            ):
+                backbone_name = backbones[int(client_id) % len(backbones)]
+                return build_fedstar_model(
+                    model_name=backbone_name,
+                    dataset=dataset,
+                    num_classes=num_classes,
+                    shared_dim=shared_dim,
+                    private_dim=private_dim,
+                    use_private_branch=use_private_branch,
+                    shared_classifier_scale=shared_classifier_scale,
+                )
+
+            args.model_factory = fedstar_model_factory
+            args.model = fedstar_model_factory(0)
             server = FedSTAR(args, i)
 
         elif args.algorithm == "FedMTL":
@@ -215,12 +281,13 @@ if __name__ == "__main__":
     parser.add_argument('-go', "--goal", type=str, default="test", 
                         help="The goal for this experiment")
     parser.add_argument('-seed', "--random_seed", type=int, default=1234)
+    parser.add_argument("--deterministic", type=str2bool, default=True)
     parser.add_argument('-dcl', "--dirchlet", type=float, default=1.0, 
                         help="dirchlet value")
     parser.add_argument('-nw', "--num_workers", type=int, default=0)
     parser.add_argument('-dev', "--device", type=str, default="cuda",
                         choices=["cpu", "cuda"])
-    parser.add_argument('-did', "--device_id", type=str, default="0")
+    parser.add_argument('-did', "--device_id", type=str, default="1")
     parser.add_argument('-data', "--dataset", type=str, default="mnist")
     parser.add_argument('-nb', "--num_classes", type=int, default=10)
     parser.add_argument('-m', "--model", type=str, default="cnn")
@@ -292,14 +359,32 @@ if __name__ == "__main__":
     parser.add_argument('-se', "--server_epochs", type=int, default=1000)
     # FedSTAR
     parser.add_argument('-dr', "--dropout", type=float, default=0.05)
-    parser.add_argument('-uf', "--use_film", type=bool, default=False)
-    parser.add_argument('-ut', "--use_transformer", type=bool, default=False)
-    parser.add_argument('-udg', "--use_decompose_with_global", type=bool, default=False)
+    parser.add_argument('-uf', "--use_film", type=str2bool, default=False)
+    parser.add_argument('-ut', "--use_transformer", type=str2bool, default=False)
+    parser.add_argument('-udg', "--use_decompose_with_global", type=str2bool, default=False)
     parser.add_argument('-sas', "--server_agg_steps", type=int, default=5)
     parser.add_argument('-sac', "--server_agg_clip", type=float, default=1.0)
     parser.add_argument('-alr', "--aggregator_learning_rate", type=float, default=0.005)
+    parser.add_argument("--client_models", type=str, default="")
+    parser.add_argument("--shared_dim", type=int, default=128)
+    parser.add_argument("--private_dim", type=int, default=128)
+    parser.add_argument("--lambda_align", type=float, default=0.3)
+    parser.add_argument("--lambda_sep", type=float, default=1.0)
+    parser.add_argument("--anchor_beta_ema", type=float, default=0.9)
+    parser.add_argument("--use_private_branch", type=str2bool, default=True)
+    parser.add_argument("--use_separation_loss", type=str2bool, default=True)
+    parser.add_argument("--use_ema", type=str2bool, default=True)
+    parser.add_argument("--normalize_shared_align", type=str2bool, default=True)
+    parser.add_argument("--use_anchor_softmax", type=str2bool, default=True)
+    parser.add_argument("--anchor_softmax_weight", type=float, default=1.0)
+    parser.add_argument("--anchor_center_weight", type=float, default=0.5)
+    parser.add_argument("--anchor_cosface_margin", type=float, default=0.15)
+    parser.add_argument("--anchor_cosface_scale", type=float, default=16.0)
+    parser.add_argument("--shared_classifier_scale", type=float, default=16.0)
+    parser.add_argument("--use_amp", type=str2bool, default=True)
 
     args = parser.parse_args()
+    set_random_seed(args.random_seed, deterministic=args.deterministic)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
 
@@ -310,6 +395,8 @@ if __name__ == "__main__":
     print("=" * 50)
 
     print("Algorithm: {}".format(args.algorithm))
+    print("Random seed: {}".format(args.random_seed))
+    print("Deterministic: {}".format(args.deterministic))
     print("Dataset: {}".format(args.dataset))
     print("Local batch size: {}".format(args.batch_size))
     print("Local steps: {}".format(args.local_epochs))
@@ -346,14 +433,28 @@ if __name__ == "__main__":
     # print("Dirchlet rate: {}".format(args.dirchlet))
     
     if args.algorithm == "FedSTAR":
-        print("use_film: {}".format(args.use_film))
-        print("use_transformer: {}".format(args.use_transformer))
-        print("use_decompose_with_global: {}".format(args.use_decompose_with_global))
-        print("server_agg_steps: {}".format(args.server_agg_steps))
-        print("server_agg_clip: {}".format(args.server_agg_clip))
-        print("Aggregator Dropout: {}".format(args.dropout))
-        print("aggregator_learning_rate: {}".format(args.aggregator_learning_rate))
-
+        client_backbones = parse_client_model_names(
+            client_models=args.client_models,
+            num_clients=args.num_clients,
+            default_model=args.model,
+        )
+        # print("client_backbones: {}".format(client_backbones))
+        print("shared_dim/private_dim: {}/{}".format(args.shared_dim, args.private_dim))
+        print("lambda_align/lambda_sep: {}/{}".format(args.lambda_align, args.lambda_sep))
+        print("anchor_beta_ema: {}".format(args.anchor_beta_ema))
+        print("use_private_branch: {}".format(args.use_private_branch))
+        print("use_separation_loss: {}".format(args.use_separation_loss))
+        print("use_ema: {}".format(args.use_ema))
+        print("normalize_shared_align: {}".format(args.normalize_shared_align))
+        print("use_anchor_softmax: {}".format(args.use_anchor_softmax))
+        print("anchor_cosface_margin/scale/weight: {}/{}/{}".format(
+            args.anchor_cosface_margin,
+            args.anchor_cosface_scale,
+            args.anchor_softmax_weight,
+        ))
+        print("shared_classifier_scale: {}".format(args.shared_classifier_scale))
+        print("anchor_center_weight: {}".format(args.anchor_center_weight))
+       
     print("Local learing rate: {}".format(args.local_learning_rate))
     print("=" * 50)
 

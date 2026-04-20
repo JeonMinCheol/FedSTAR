@@ -1,3 +1,18 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
+RUN_TAG="${RUN_TAG:-$(date '+%Y%m%d_%H%M%S')}"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/test_${RUN_TAG}.txt}"
+
+mkdir -p "$LOG_DIR"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "[test.sh] Logging to: $LOG_FILE"
+echo "[test.sh] Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+
 model=mobilenet_v3
 dcl=0.1
 lbs=256
@@ -5,10 +20,19 @@ jr=0.3
 ls=3
 nc=100
 gr=300
+seeds=(42)
 
-for seed in 42 43 44; do 
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+
+echo "[test.sh] Fixed seeds: ${seeds[*]}"
+echo "[test.sh] CUBLAS_WORKSPACE_CONFIG: $CUBLAS_WORKSPACE_CONFIG"
+
+for seed in "${seeds[@]}"; do
+export PYTHONHASHSEED="$seed"
+echo "[test.sh] Running seed: $seed"
+echo "[test.sh] PYTHONHASHSEED: $PYTHONHASHSEED"
 # =================================================================== CIFAR-100 ===================================================================
-# python -u main.py -gr $gr -dcl $dcl -lbs $lbs -nc $nc -jr $jr -nb 100 -ls $ls -data Cifar100 -m $model -algo FedSTAR -lr 0.4 -alr 0.01 -sas 10 -sac 1.0 -dr 0.05 -udg True -uf True -ut True -seed $seed
+python -u main.py -gr $gr -dcl $dcl -lbs $lbs -nc $nc -jr $jr -nb 100 -ls $ls -data Cifar100 -m $model -algo FedSTAR -lr 0.05 --use_private_branch True -seed $seed
 # python -u main.py -gr $gr -dcl $dcl -lbs $lbs -nc $nc -jr $jr -nb 100 -ls $ls -data Cifar100 -m $model -algo Ditto -lr 0.15 -seed $seed
 # python -u main.py -gr $gr -dcl $dcl -lbs $lbs -nc $nc -jr $jr -nb 100 -ls $ls -data Cifar100 -m $model -algo FedALA -lr 0.5 -et 1.0 -seed $seed
 # python -u main.py -gr $gr -dcl $dcl -lbs $lbs -nc $nc -jr $jr -nb 100 -ls $ls -data Cifar100 -m $model -algo FedRep -lr 0.1 -seed $seed

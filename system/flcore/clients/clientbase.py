@@ -16,13 +16,19 @@ class Client(object):
     """
 
     def __init__(self, args, id, train_samples, test_samples, **kwargs):
-        torch.manual_seed(0)
-        np.random.seed(0)
-        torch.cuda.manual_seed_all(0)
+        seed = int(getattr(args, "random_seed", 0))
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        self.model = copy.deepcopy(args.model)
+        model_factory = getattr(args, "model_factory", None)
+        if callable(model_factory):
+            self.model = model_factory(id)
+        else:
+            self.model = copy.deepcopy(args.model)
         self.algorithm = args.algorithm
         self.dataset = args.dataset
         self.device = args.device
