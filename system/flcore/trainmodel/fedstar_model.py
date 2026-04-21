@@ -25,6 +25,7 @@ class FedSTARModel(nn.Module):
         shared_dim: int = 128,
         private_dim: int = 128,
         use_private_branch: bool = True,
+        private_logit_weight: float = 0.0,
         shared_classifier_scale: float = 16.0,
         backbone_name: str = "unknown",
     ):
@@ -32,26 +33,20 @@ class FedSTARModel(nn.Module):
         self.base = base
         self.feature_dim = int(feature_dim)
         self.shared_dim = int(shared_dim)
-        self.private_dim = int(private_dim) if use_private_branch else 0
+        self.private_dim = int(private_dim)
         self.use_private_branch = bool(use_private_branch)
+        self.private_logit_weight = float(private_logit_weight)
         self.shared_classifier_scale = float(shared_classifier_scale)
         self.backbone_name = str(backbone_name)
 
         self.shared_projector = nn.Linear(self.feature_dim, self.shared_dim)
-        self.private_projector = (
-            nn.Linear(self.feature_dim, self.private_dim)
-            if self.use_private_branch
-            else None
-        )
         self.shared_head = nn.Linear(self.shared_dim, num_classes, bias=False)
-        self.private_head = (
-            nn.Linear(self.private_dim, num_classes)
-            if self.use_private_branch
-            else None
-        )
-        if self.private_head is not None:
-            nn.init.zeros_(self.private_head.weight)
-            nn.init.zeros_(self.private_head.bias)
+        if self.use_private_branch:
+            self.private_projector = nn.Linear(self.feature_dim, self.private_dim)
+            self.private_head = nn.Linear(self.private_dim, num_classes, bias=False)
+        else:
+            self.private_projector = None
+            self.private_head = None
 
     def extract_backbone(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.base(x)
@@ -62,32 +57,40 @@ class FedSTARModel(nn.Module):
         return feat
 
     def project(self, feat: torch.Tensor):
-        z_s = self.shared_projector(feat)
-        if self.use_private_branch and self.private_projector is not None:
-            z_p = self.private_projector(feat)
-        else:
-            z_p = feat.new_zeros((feat.size(0), 0))
-        return z_s, z_p
+        return self.shared_projector(feat)
 
-    def classify(self, z_s: torch.Tensor, z_p: torch.Tensor):
+    def shared_representation(self, x: torch.Tensor):
+        feat = self.extract_backbone(x)
+        return self.project(feat)
+
+    def classify(self, z_s: torch.Tensor):
         z_s_norm = F.normalize(z_s, p=2, dim=1)
         shared_weight = F.normalize(self.shared_head.weight, p=2, dim=1)
-        shared_logits = self.shared_classifier_scale * (z_s_norm @ shared_weight.T)
-        if self.use_private_branch and self.private_head is not None and z_p.numel() > 0:
-            private_logits = self.private_head(z_p)
-        else:
-            private_logits = shared_logits.new_zeros(shared_logits.shape)
-        logits = shared_logits + private_logits
-        return logits, shared_logits, private_logits
+        return self.shared_classifier_scale * (z_s_norm @ shared_weight.T)
+
+    def classify_private(self, z_p: torch.Tensor):
+        if (not self.use_private_branch) or self.private_head is None:
+            return None
+        z_p_norm = F.normalize(z_p, p=2, dim=1)
+        private_weight = F.normalize(self.private_head.weight, p=2, dim=1)
+        return self.shared_classifier_scale * (z_p_norm @ private_weight.T)
 
     def extract_embeddings(self, x: torch.Tensor):
         feat = self.extract_backbone(x)
-        z_s, z_p = self.project(feat)
+        z_s = self.project(feat)
+        if self.use_private_branch and self.private_projector is not None:
+            z_p = self.private_projector(feat)
+        else:
+            z_p = z_s.new_zeros(z_s.size(0), 0)
         return feat, z_s, z_p
 
     def forward(self, x: torch.Tensor, return_features: bool = False):
         feat, z_s, z_p = self.extract_embeddings(x)
-        logits, shared_logits, private_logits = self.classify(z_s, z_p)
+        shared_logits = self.classify(z_s)
+        private_logits = self.classify_private(z_p)
+        if private_logits is None:
+            private_logits = torch.zeros_like(shared_logits)
+        logits = shared_logits + self.private_logit_weight * private_logits
         if return_features:
             return logits, feat, z_s, z_p, shared_logits, private_logits
         return logits
@@ -226,6 +229,7 @@ def build_fedstar_model(
     shared_dim: int = 128,
     private_dim: int = 128,
     use_private_branch: bool = True,
+    private_logit_weight: float = 0.0,
     shared_classifier_scale: float = 16.0,
 ) -> FedSTARModel:
     raw_model = _build_raw_model(model_name=model_name, dataset=dataset, num_classes=num_classes)
@@ -243,6 +247,7 @@ def build_fedstar_model(
         shared_dim=shared_dim,
         private_dim=private_dim,
         use_private_branch=use_private_branch,
+        private_logit_weight=private_logit_weight,
         shared_classifier_scale=shared_classifier_scale,
         backbone_name=model_name,
     )

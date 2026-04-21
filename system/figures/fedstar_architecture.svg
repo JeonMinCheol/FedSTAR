@@ -1,0 +1,165 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="960" viewBox="0 0 1600 960" role="img" aria-labelledby="title desc">
+  <title id="title">FedSTAR Architecture</title>
+  <desc id="desc">Architecture diagram for style-disentangled representation-only federated learning with semantic anchor memory.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#0F172A" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#2563EB"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#059669"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#D97706"/>
+    </marker>
+    <marker id="arrowGray" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#64748B"/>
+    </marker>
+    <style>
+      .bg { fill: #FAFBFC; }
+      .panel-client { fill: #E8EDF2; }
+      .panel-server { fill: #F5F0E8; }
+      .panel-note { fill: #E8F2EE; }
+      .box { fill: #FFFFFF; filter: url(#shadow); }
+      .box-blue { fill: #EFF6FF; filter: url(#shadow); }
+      .box-green { fill: #ECFDF5; filter: url(#shadow); }
+      .box-amber { fill: #FFFBEB; filter: url(#shadow); }
+      .box-rose { fill: #FFF1F2; filter: url(#shadow); }
+      .chip-blue { fill: #DBEAFE; stroke: #2563EB; stroke-width: 1.5; }
+      .chip-green { fill: #D1FAE5; stroke: #059669; stroke-width: 1.5; }
+      .chip-amber { fill: #FEF3C7; stroke: #D97706; stroke-width: 1.5; }
+      .chip-rose { fill: #FFE4E6; stroke: #E11D48; stroke-width: 1.5; }
+      .title { font-family: Arial, Helvetica, sans-serif; font-size: 36px; font-weight: 700; fill: #0F172A; }
+      .subtitle { font-family: Arial, Helvetica, sans-serif; font-size: 18px; font-weight: 400; fill: #475569; }
+      .section { font-family: Arial, Helvetica, sans-serif; font-size: 22px; font-weight: 700; fill: #0F172A; letter-spacing: 0.2px; }
+      .label { font-family: Arial, Helvetica, sans-serif; font-size: 17px; font-weight: 700; fill: #0F172A; }
+      .body { font-family: Arial, Helvetica, sans-serif; font-size: 14px; font-weight: 400; fill: #334155; }
+      .small { font-family: Arial, Helvetica, sans-serif; font-size: 12px; font-weight: 400; fill: #475569; }
+      .tiny { font-family: Arial, Helvetica, sans-serif; font-size: 11px; font-weight: 700; fill: #64748B; letter-spacing: 0.8px; }
+      .arrow-blue { stroke: #2563EB; stroke-width: 3; fill: none; marker-end: url(#arrowBlue); }
+      .arrow-green { stroke: #059669; stroke-width: 3; fill: none; marker-end: url(#arrowGreen); }
+      .arrow-amber { stroke: #D97706; stroke-width: 3; fill: none; marker-end: url(#arrowAmber); }
+      .arrow-gray { stroke: #64748B; stroke-width: 2.2; fill: none; marker-end: url(#arrowGray); }
+      .arrow-dashed { stroke: #94A3B8; stroke-width: 2; fill: none; stroke-dasharray: 7 7; }
+      .divider { stroke: #CBD5E1; stroke-width: 1.5; stroke-dasharray: 8 8; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="960"/>
+
+  <text class="title" x="80" y="64">FedSTAR: Style-Disentangled Representation-Only Federated Learning</text>
+  <text class="subtitle" x="80" y="96">Clients keep private style locally, upload only shared class statistics, and synchronize through a semantic anchor coordinate system.</text>
+
+  <rect class="panel-client" x="60" y="130" width="900" height="690" rx="26"/>
+  <rect class="panel-server" x="1020" y="130" width="520" height="690" rx="26"/>
+  <text class="section" x="95" y="172">Local clients (repeated for selected clients)</text>
+  <text class="section" x="1055" y="172">Server anchor memory</text>
+
+  <rect class="box" x="100" y="215" width="165" height="100" rx="16"/>
+  <text class="label" x="125" y="250">Local data</text>
+  <text class="body" x="125" y="276">non-IID batch</text>
+  <text class="body" x="125" y="298">(x, y)</text>
+
+  <rect class="box" x="315" y="205" width="195" height="120" rx="16"/>
+  <text class="label" x="345" y="242">Backbone f_k</text>
+  <text class="body" x="345" y="268">client-specific</text>
+  <text class="body" x="345" y="290">feature extractor</text>
+
+  <rect class="box-blue" x="560" y="175" width="220" height="115" rx="16"/>
+  <text class="tiny" x="590" y="204">SHARED BRANCH</text>
+  <text class="label" x="590" y="234">Shared projector</text>
+  <text class="body" x="590" y="260">z_s: class semantics</text>
+
+  <rect class="box-rose" x="560" y="335" width="220" height="115" rx="16"/>
+  <text class="tiny" x="590" y="364">PRIVATE BRANCH</text>
+  <text class="label" x="590" y="394">Private projector</text>
+  <text class="body" x="590" y="420">z_p: domain style</text>
+
+  <rect class="box-blue" x="805" y="175" width="120" height="115" rx="16"/>
+  <text class="label" x="830" y="224">Cosine</text>
+  <text class="label" x="838" y="248">head</text>
+  <text class="small" x="826" y="271">shared logits</text>
+
+  <rect class="box-rose" x="805" y="335" width="120" height="115" rx="16"/>
+  <text class="label" x="832" y="384">Private</text>
+  <text class="label" x="841" y="408">head</text>
+  <text class="small" x="824" y="431">style logits</text>
+
+  <rect class="box-amber" x="725" y="490" width="200" height="90" rx="16"/>
+  <text class="label" x="758" y="526">Prediction</text>
+  <text class="body" x="758" y="552">weighted CE loss</text>
+
+  <path class="arrow-gray" d="M265 265 C285 265, 295 265, 315 265"/>
+  <path class="arrow-gray" d="M510 265 C535 255, 540 230, 560 230"/>
+  <path class="arrow-gray" d="M510 265 C535 300, 540 385, 560 395"/>
+  <path class="arrow-gray" d="M780 232 C790 232, 795 232, 805 232"/>
+  <path class="arrow-gray" d="M780 392 C790 392, 795 392, 805 392"/>
+  <path class="arrow-amber" d="M865 290 C865 340, 815 440, 810 490"/>
+  <path class="arrow-amber" d="M865 450 C865 470, 855 480, 845 490"/>
+
+  <rect class="box" x="100" y="505" width="555" height="250" rx="18"/>
+  <text class="label" x="130" y="542">Local training objectives</text>
+  <rect class="chip-amber" x="130" y="568" width="220" height="55" rx="14"/>
+  <text class="body" x="152" y="591">Weighted classification</text>
+  <text class="small" x="152" y="611">cls_weight CE + shared CE</text>
+  <rect class="chip-blue" x="375" y="568" width="250" height="55" rx="14"/>
+  <text class="body" x="397" y="591">Anchor-guided alignment</text>
+  <text class="small" x="397" y="611">CosFace + relation profile</text>
+  <rect class="chip-rose" x="130" y="645" width="220" height="55" rx="14"/>
+  <text class="body" x="152" y="668">Shared-private separation</text>
+  <text class="small" x="152" y="688">decorrelate z_s and z_p</text>
+  <rect class="chip-green" x="375" y="645" width="250" height="55" rx="14"/>
+  <text class="body" x="397" y="668">Style decomposition</text>
+  <text class="small" x="397" y="688">content proj + style residual</text>
+  <text class="small" x="130" y="730">Private style prototypes remain local and are never uploaded.</text>
+
+  <path class="arrow-blue" d="M670 290 C670 415, 525 500, 500 568"/>
+  <path class="arrow-gray" d="M670 450 C630 505, 485 590, 465 645"/>
+
+  <rect class="box-green" x="1060" y="215" width="405" height="110" rx="18"/>
+  <text class="label" x="1090" y="250">Shared statistics inbox</text>
+  <text class="body" x="1090" y="276">per class c: count, mu_s, var_s</text>
+  <text class="small" x="1090" y="300">uploaded from selected clients only</text>
+
+  <rect class="box-amber" x="1060" y="375" width="405" height="110" rx="18"/>
+  <text class="label" x="1090" y="410">Count-weighted EMA aggregation</text>
+  <text class="body" x="1090" y="436">updates class anchors A_c</text>
+  <text class="small" x="1090" y="460">stable semantic coordinate memory</text>
+
+  <rect class="box-blue" x="1060" y="535" width="405" height="120" rx="18"/>
+  <text class="label" x="1090" y="570">Semantic Anchor Memory</text>
+  <text class="body" x="1090" y="596">A_1 ... A_C, anchor var, counts</text>
+  <text class="small" x="1090" y="620">FedSA-style anchor, used as support module</text>
+  <text class="small" x="1090" y="642">not a shared model parameter</text>
+
+  <rect class="box-green" x="1060" y="700" width="405" height="70" rx="18"/>
+  <text class="label" x="1090" y="733">Broadcast anchor state</text>
+  <text class="body" x="1090" y="756">anchors guide next local round</text>
+
+  <path class="arrow-green" d="M1262 325 C1262 348, 1262 352, 1262 375"/>
+  <path class="arrow-green" d="M1262 485 C1262 508, 1262 512, 1262 535"/>
+  <path class="arrow-green" d="M1262 655 C1262 680, 1262 682, 1262 700"/>
+
+  <path class="arrow-blue" d="M780 230 C920 210, 985 235, 1060 260"/>
+  <text class="small" x="825" y="206">upload shared class stats only</text>
+
+  <path class="arrow-green" d="M1060 735 C930 755, 760 735, 610 700"/>
+  <text class="small" x="760" y="760">broadcast anchors to all clients</text>
+
+  <path class="arrow-amber" d="M1060 610 C930 625, 725 610, 505 596"/>
+  <text class="small" x="720" y="586">anchor relation and class separation</text>
+
+  <line class="divider" x1="960" y1="155" x2="960" y2="815"/>
+  <text class="tiny" x="778" y="815">CLIENT SIDE</text>
+  <text class="tiny" x="1220" y="815">SERVER SIDE</text>
+
+  <rect class="panel-note" x="185" y="850" width="1230" height="60" rx="18"/>
+  <text class="label" x="220" y="886">Communication contract:</text>
+  <text class="body" x="440" y="886">share representation statistics and anchors only</text>
+  <text class="body" x="820" y="886">no raw data</text>
+  <text class="body" x="960" y="886">no model weights</text>
+  <text class="body" x="1130" y="886">no private style upload</text>
+  <path class="arrow-dashed" d="M800 842 C800 828, 800 828, 800 812"/>
+</svg>

@@ -12,6 +12,7 @@ from utils.data_utils import read_client_data
 from utils.dlg import DLG
 from scipy.stats import entropy
 import csv
+from utils.wandb_utils import wandb_log
 
 def safe_auc(y_true, y_prob):
     try:
@@ -389,6 +390,29 @@ class Server(object):
     def test_metrics_new_clients(self):
         pass
 
+    def _weighted_debug_summary(self, weighted_debug_items):
+        if len(weighted_debug_items) == 0:
+            return {}
+
+        keys = sorted({
+            key
+            for _, debug in weighted_debug_items
+            for key in getattr(debug, "keys", lambda: [])()
+        })
+        summary = {}
+        for key in keys:
+            weight_sum = 0.0
+            value_sum = 0.0
+            for weight, debug in weighted_debug_items:
+                if key not in debug:
+                    continue
+                weight_f = float(weight)
+                value_sum += weight_f * float(debug.get(key, 0.0))
+                weight_sum += weight_f
+            if weight_sum > 0:
+                summary[key] = value_sum / weight_sum
+        return summary
+
     def test_metrics(self, test_loader=None):
         if getattr(self, "eval_new_clients", False) and getattr(self, "num_new_clients", 0) > 0:
             self.fine_tuning_new_clients()
@@ -396,6 +420,7 @@ class Server(object):
 
         all_y_prob, all_y_true = [], []
         client_aucs, client_accs, client_fscores, client_eces = [], [], [], []
+        eval_debug_items = []
 
         global_num = 0
         global_correct = 0
@@ -407,6 +432,10 @@ class Server(object):
             correct_c, num_c, y_prob_c, y_true_c = result
             if num_c <= 1e-5:
                 continue
+
+            client_debug = getattr(c, "latest_eval_debug", {})
+            if client_debug:
+                eval_debug_items.append((float(num_c), client_debug))
 
             y_true_c = np.asarray(y_true_c)
             y_prob_c = np.asarray(y_prob_c)
@@ -465,6 +494,7 @@ class Server(object):
             "brier_score": global_brier,
             "entropy": global_entropy,
         }
+        self.eval_debug_summary = self._weighted_debug_summary(eval_debug_items)
 
         return (global_acc, global_auc, global_fscore, global_ece_mean,
                 acc_std, auc_std, f1_std, ece_std)
@@ -480,6 +510,8 @@ class Server(object):
             print("Averaged Test AUC: {:.4f}".format(test_auc))
             print("Averaged Test F1: {:.4f}".format(test_fscore))
             print("Averaged Test ECE: {:.4f}".format(test_ece))
+        if train_acc is not None and test_acc is not None:
+            print("Generalization Gap: {:.4f}".format(train_acc - test_acc))
 
         # 추가 요약
         if hasattr(self, "analysis_dict"):
@@ -494,13 +526,18 @@ class Server(object):
         num_samples = []
         losses = []
         accuracies = []
+        train_debug_items = []
         for c in self.clients:
             ls, ns, tc = c.train_metrics()
             num_samples.append(ns)
             losses.append(ls*1.0)
             accuracies.append(tc*1.0)
+            client_debug = getattr(c, "latest_train_eval_debug", {})
+            if client_debug:
+                train_debug_items.append((float(ns), client_debug))
 
         ids = [c.id for c in self.clients]
+        self.train_eval_debug_summary = self._weighted_debug_summary(train_debug_items)
 
         return ids, num_samples, losses, accuracies
 
@@ -519,6 +556,7 @@ class Server(object):
         # --- 3. CSV 헤더 (한 번만 생성) ---
         header = [
             "round","train_loss","train_acc","test_acc","test_auc","test_fscore","test_ece",
+            "generalization_gap",
             "precision_mean",
             "recall_mean",
             "f1_class_mean",
@@ -544,6 +582,7 @@ class Server(object):
             rnd,
             f"{train_loss:.4f}", f"{train_acc:.4f}",
             f"{test_acc:.4f}", f"{test_auc:.4f}", f"{test_fscore:.4f}", f"{test_ece:.4f}",
+            f"{(train_acc - test_acc):.4f}",
             f"{np.mean(precision):.4f}",
             f"{np.mean(recall):.4f}",
             f"{np.mean(f1_class):.4f}",
@@ -555,9 +594,82 @@ class Server(object):
             writer = csv.writer(f)
             writer.writerow(row)
 
+        eval_payload = {
+                "eval/train_loss": float(train_loss),
+                "eval/train_acc": float(train_acc),
+                "eval/test_acc": float(test_acc),
+                "eval/test_auc": float(test_auc),
+                "eval/test_f1": float(test_fscore),
+                "eval/test_ece": float(test_ece),
+                "eval/generalization_gap": float(train_acc - test_acc),
+                "eval/acc_std": float(acc_std),
+                "eval/auc_std": float(auc_std),
+                "eval/f1_std": float(f1_std),
+                "eval/ece_std": float(ece_std),
+                "eval/precision_mean": float(np.mean(precision)),
+                "eval/recall_mean": float(np.mean(recall)),
+                "eval/f1_class_mean": float(np.mean(f1_class)),
+                "eval/brier_score": float(brier),
+                "eval/entropy": float(entropy_v),
+                f"{str(self.algorithm).lower()}/loss/eval_train": float(train_loss),
+        }
+        diagnostic_metrics = {}
+        eval_debug_summary = getattr(self, "eval_debug_summary", {})
+        train_debug_summary = getattr(self, "train_eval_debug_summary", {})
+        for key, value in eval_debug_summary.items():
+            diagnostic_metrics[f"{str(self.algorithm).lower()}/diag/eval/{key}"] = float(value)
+        for key, value in train_debug_summary.items():
+            diagnostic_metrics[f"{str(self.algorithm).lower()}/diag/train/{key}"] = float(value)
+        if eval_debug_summary and train_debug_summary:
+            algo_key = str(self.algorithm).lower()
+            if "train_eval_acc" in train_debug_summary and "eval_acc" in eval_debug_summary:
+                diagnostic_metrics[f"{algo_key}/diag/gap/acc"] = float(
+                    train_debug_summary.get("train_eval_acc", 0.0)
+                    - eval_debug_summary.get("eval_acc", 0.0)
+                )
+            if "train_eval_frame_fit" in train_debug_summary and "eval_frame_fit" in eval_debug_summary:
+                diagnostic_metrics[f"{algo_key}/diag/gap/frame_fit"] = float(
+                    train_debug_summary.get("train_eval_frame_fit", 0.0)
+                    - eval_debug_summary.get("eval_frame_fit", 0.0)
+                )
+        eval_payload.update(diagnostic_metrics)
+        wandb_log(
+            eval_payload,
+            step=rnd,
+        )
+
         # --- 7. 콘솔 출력 ---
         self._print(train_loss, train_acc, test_acc, test_auc, test_fscore,
                     test_ece, acc_std, auc_std, f1_std, ece_std)
+        eval_debug = getattr(self, "eval_debug_summary", {})
+        train_debug = getattr(self, "train_eval_debug_summary", {})
+        if eval_debug:
+            eval_frame = eval_debug.get("eval_frame_fit", None)
+            eval_frame_text = "" if eval_frame is None else f" | frame_fit={float(eval_frame):.4f}"
+            print(
+                "FedSTAR EvalDiag "
+                f"acc={eval_debug.get('eval_acc', 0.0):.4f}"
+                f"{eval_frame_text}"
+            )
+        if train_debug:
+            train_frame = train_debug.get("train_eval_frame_fit", None)
+            train_frame_text = "" if train_frame is None else f" | frame_fit={float(train_frame):.4f}"
+            print(
+                "FedSTAR TrainDiag "
+                f"acc={train_debug.get('train_eval_acc', 0.0):.4f}"
+                f"{train_frame_text}"
+            )
+        if eval_debug and train_debug:
+            acc_gap = train_debug.get("train_eval_acc", 0.0) - eval_debug.get("eval_acc", 0.0)
+            frame_gap_text = ""
+            if "train_eval_frame_fit" in train_debug and "eval_frame_fit" in eval_debug:
+                frame_gap = train_debug.get("train_eval_frame_fit", 0.0) - eval_debug.get("eval_frame_fit", 0.0)
+                frame_gap_text = f" | frame_fit={float(frame_gap):.4f}"
+            print(
+                "FedSTAR GapDiag "
+                f"acc={float(acc_gap):.4f}"
+                f"{frame_gap_text}"
+            )
 
         return (
             train_loss, train_acc, test_acc, test_auc, test_fscore,

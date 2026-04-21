@@ -23,7 +23,7 @@ class clientstar(Client):
 
         self.lambda_align = float(args.lambda_align)
         self.lambda_sep = float(args.lambda_sep)
-        self.lambda_private_style = 0.1
+        self.lambda_private_style = float(getattr(args, "lambda_private_style", 0.0))
         self.shared_cls_weight = 1.0
         self.anchor_eps = 1e-6
         self.anchor_softmax_weight = float(getattr(args, "anchor_softmax_weight", 1.0))
@@ -520,17 +520,11 @@ class clientstar(Client):
         with torch.no_grad():
             for x, y in trainloader:
                 x, y = self._move_input(x, y)
-                logits, z_s, z_p, shared_logits, _ = self._forward_batch(x)
-                total_loss, _, _, _, _, _ = self._loss_terms(
-                    logits,
-                    shared_logits,
-                    y,
-                    z_s,
-                    z_p,
-                )
+                logits, _, _, _, _ = self._forward_batch(x)
+                cls_loss = self.loss(logits, y)
 
                 train_num += y.shape[0]
-                losses += total_loss.item() * y.shape[0]
+                losses += cls_loss.item() * y.shape[0]
                 train_correct += (torch.argmax(logits, dim=1) == y).sum().item()
 
         return losses, train_num, train_correct

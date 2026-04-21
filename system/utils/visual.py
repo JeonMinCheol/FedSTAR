@@ -4,7 +4,10 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
-import umap
+try:
+    import umap
+except ImportError:
+    umap = None
 
 @torch.no_grad()
 def visualize_client_umap(client_model, dataloader, device="cuda", title="Client Feature UMAP"):
@@ -35,6 +38,9 @@ def visualize_client_umap(client_model, dataloader, device="cuda", title="Client
 
     # 표준화
     features = StandardScaler().fit_transform(features)
+
+    if umap is None:
+        raise ImportError("umap-learn is required for visualize_client_umap().")
 
     print("🎨 Running UMAP...")
     reducer = umap.UMAP(

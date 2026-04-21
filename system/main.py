@@ -9,15 +9,6 @@ import warnings
 import numpy as np
 import logging
 
-from flcore.servers.servermtl import FedMTL
-from flcore.servers.serverditto import Ditto
-from flcore.servers.serverrep import FedRep
-from flcore.servers.serverproto import FedProto
-from flcore.servers.serverala import FedALA
-from flcore.servers.serverstar import FedSTAR
-from flcore.servers.serverpac import FedPAC
-from flcore.servers.servertgp import FedTGP
-
 from flcore.trainmodel.models import *
 from flcore.trainmodel.fedstar_model import build_fedstar_model, parse_client_model_names
 
@@ -28,7 +19,7 @@ from flcore.trainmodel.mobilenet_v2 import *
 from flcore.trainmodel.mobilenet_v3 import *
 from flcore.trainmodel.transformer import *
 
-from utils.mem_utils import MemReporter
+from utils.wandb_utils import finish_wandb, init_wandb, wandb_log
 
 logger = logging.getLogger()
 logger.setLevel(logging.ERROR)
@@ -72,8 +63,8 @@ def set_random_seed(seed: int, deterministic: bool = True):
 
 def run(args):
     time_list = []
-    reporter = MemReporter()
     model_str = args.model
+    args.model_name = model_str
     fedstar_client_backbones = None
     fedstar_bootstrap_model = model_str
 
@@ -193,6 +184,8 @@ def run(args):
 
         # select algorithm
         if args.algorithm == "FedSTAR":
+            from flcore.servers.serverstar import FedSTAR
+
             def fedstar_model_factory(
                 client_id,
                 backbones=tuple(fedstar_client_backbones),
@@ -201,6 +194,7 @@ def run(args):
                 shared_dim=args.shared_dim,
                 private_dim=args.private_dim,
                 use_private_branch=args.use_private_branch,
+                private_logit_weight=args.private_logit_weight,
                 shared_classifier_scale=args.shared_classifier_scale,
             ):
                 backbone_name = backbones[int(client_id) % len(backbones)]
@@ -211,6 +205,7 @@ def run(args):
                     shared_dim=shared_dim,
                     private_dim=private_dim,
                     use_private_branch=use_private_branch,
+                    private_logit_weight=private_logit_weight,
                     shared_classifier_scale=shared_classifier_scale,
                 )
 
@@ -219,42 +214,56 @@ def run(args):
             server = FedSTAR(args, i)
 
         elif args.algorithm == "FedMTL":
+            from flcore.servers.servermtl import FedMTL
+
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedMTL(args, i)
 
         elif args.algorithm == "FedTGP":
+            from flcore.servers.servertgp import FedTGP
+
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedTGP(args, i)
 
         elif args.algorithm == "Ditto":
+            from flcore.servers.serverditto import Ditto
+
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = Ditto(args, i)
 
         elif args.algorithm == "FedRep":
+            from flcore.servers.serverrep import FedRep
+
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedRep(args, i)
 
         elif args.algorithm == "FedProto":
+            from flcore.servers.serverproto import FedProto
+
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedProto(args, i)
 
         elif args.algorithm == "FedALA":
+            from flcore.servers.serverala import FedALA
+
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedALA(args, i)
 
         elif args.algorithm == "FedPAC":
+            from flcore.servers.serverpac import FedPAC
+
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
@@ -263,14 +272,17 @@ def run(args):
         else:
             raise NotImplementedError
 
-        server.train()
-
-        time_list.append(time.time()-start)
+        init_wandb(args, run_index=i)
+        try:
+            server.train()
+            elapsed = time.time() - start
+            wandb_log({"runtime/time_cost_sec": elapsed}, step=args.global_rounds)
+            time_list.append(elapsed)
+        finally:
+            finish_wandb()
 
     print(f"\nAverage time cost: {round(np.average(time_list), 2)}s.")
     print("All done!")
-
-    reporter.report()
 
 
 if __name__ == "__main__":
@@ -323,6 +335,14 @@ if __name__ == "__main__":
     parser.add_argument('-nnc', "--num_new_clients", type=int, default=0)
     parser.add_argument('-fte', "--fine_tuning_epoch", type=int, default=0)
     parser.add_argument('-fd', "--feature_dim", type=int, default=128)
+    parser.add_argument("--use_amp", type=str2bool, default=True)
+    parser.add_argument("--use_wandb", type=str2bool, default=False)
+    parser.add_argument("--wandb_project", type=str, default="FedSTAR")
+    parser.add_argument("--wandb_entity", type=str, default="")
+    parser.add_argument("--wandb_group", type=str, default="")
+    parser.add_argument("--wandb_name", type=str, default="")
+    parser.add_argument("--wandb_mode", type=str, default="online")
+    parser.add_argument("--wandb_tags", type=str, default="")
 
     # practical
     parser.add_argument('-cdr', "--client_drop_rate", type=float, default=0.0,
@@ -358,30 +378,34 @@ if __name__ == "__main__":
     parser.add_argument('-mart', "--margin_threthold", type=float, default=100.0)
     parser.add_argument('-se', "--server_epochs", type=int, default=1000)
     # FedSTAR
-    parser.add_argument('-dr', "--dropout", type=float, default=0.05)
-    parser.add_argument('-uf', "--use_film", type=str2bool, default=False)
-    parser.add_argument('-ut', "--use_transformer", type=str2bool, default=False)
-    parser.add_argument('-udg', "--use_decompose_with_global", type=str2bool, default=False)
-    parser.add_argument('-sas', "--server_agg_steps", type=int, default=5)
-    parser.add_argument('-sac', "--server_agg_clip", type=float, default=1.0)
-    parser.add_argument('-alr', "--aggregator_learning_rate", type=float, default=0.005)
     parser.add_argument("--client_models", type=str, default="")
     parser.add_argument("--shared_dim", type=int, default=128)
     parser.add_argument("--private_dim", type=int, default=128)
-    parser.add_argument("--lambda_align", type=float, default=0.3)
-    parser.add_argument("--lambda_sep", type=float, default=1.0)
-    parser.add_argument("--anchor_beta_ema", type=float, default=0.9)
     parser.add_argument("--use_private_branch", type=str2bool, default=True)
     parser.add_argument("--use_separation_loss", type=str2bool, default=True)
-    parser.add_argument("--use_ema", type=str2bool, default=True)
+    parser.add_argument("--lambda_align", type=float, default=1.0)
+    parser.add_argument("--lambda_sep", type=float, default=0.0)
+    parser.add_argument("--lambda_private_style", type=float, default=0.0)
+    parser.add_argument("--private_logit_weight", type=float, default=0.0)
     parser.add_argument("--normalize_shared_align", type=str2bool, default=True)
     parser.add_argument("--use_anchor_softmax", type=str2bool, default=True)
     parser.add_argument("--anchor_softmax_weight", type=float, default=1.0)
     parser.add_argument("--anchor_center_weight", type=float, default=0.5)
     parser.add_argument("--anchor_cosface_margin", type=float, default=0.15)
     parser.add_argument("--anchor_cosface_scale", type=float, default=16.0)
-    parser.add_argument("--shared_classifier_scale", type=float, default=16.0)
-    parser.add_argument("--use_amp", type=str2bool, default=True)
+    parser.add_argument("--anchor_beta_ema", type=float, default=0.95)
+    parser.add_argument("--use_ema", type=str2bool, default=True)
+    parser.add_argument("--num_frame_anchors", type=int, default=64)
+    parser.add_argument("--lambda_frame", type=float, default=0.0)
+    parser.add_argument("--num_anchor_inputs", type=int, default=128)
+    parser.add_argument("--lambda_anchor", type=float, default=0.1)
+    parser.add_argument("--anchor_ema", type=float, default=0.9)
+    parser.add_argument("--frame_update_period", type=int, default=5)
+    parser.add_argument("--frame_update_start", type=int, default=0)
+    parser.add_argument("--frame_update_alpha", type=float, default=0.02)
+    parser.add_argument("--frame_max_shift", type=float, default=0.05)
+    parser.add_argument("--shared_classifier_scale", type=float, default=8.0)
+
 
     args = parser.parse_args()
     set_random_seed(args.random_seed, deterministic=args.deterministic)
@@ -414,6 +438,9 @@ if __name__ == "__main__":
     print("Number of classes: {}".format(args.num_classes))
     print("Backbone: {}".format(args.model))
     print("Using device: {}".format(args.device))
+    print("W&B logging: {}".format(args.use_wandb))
+    if args.use_wandb:
+        print("W&B project/mode: {}/{}".format(args.wandb_project, args.wandb_mode))
 
     if args.privacy:
         print("Sigma for DP: {}".format(args.dp_sigma))
@@ -439,21 +466,41 @@ if __name__ == "__main__":
             default_model=args.model,
         )
         # print("client_backbones: {}".format(client_backbones))
-        print("shared_dim/private_dim: {}/{}".format(args.shared_dim, args.private_dim))
-        print("lambda_align/lambda_sep: {}/{}".format(args.lambda_align, args.lambda_sep))
-        print("anchor_beta_ema: {}".format(args.anchor_beta_ema))
-        print("use_private_branch: {}".format(args.use_private_branch))
-        print("use_separation_loss: {}".format(args.use_separation_loss))
-        print("use_ema: {}".format(args.use_ema))
-        print("normalize_shared_align: {}".format(args.normalize_shared_align))
-        print("use_anchor_softmax: {}".format(args.use_anchor_softmax))
-        print("anchor_cosface_margin/scale/weight: {}/{}/{}".format(
+        print("shared_dim: {}".format(args.shared_dim))
+        print("private_dim/use_private_branch: {}/{}".format(
+            args.private_dim,
+            args.use_private_branch,
+        ))
+        print("private_logit_weight: {}".format(args.private_logit_weight))
+        print("lambda_align/lambda_sep/lambda_private_style: {}/{}/{}".format(
+            args.lambda_align,
+            args.lambda_sep,
+            args.lambda_private_style,
+        ))
+        print("anchor_softmax/center/margin/scale: {}/{}/{}/{}".format(
+            args.anchor_softmax_weight,
+            args.anchor_center_weight,
             args.anchor_cosface_margin,
             args.anchor_cosface_scale,
-            args.anchor_softmax_weight,
+        ))
+        print("anchor_beta_ema/use_ema: {}/{}".format(
+            args.anchor_beta_ema,
+            args.use_ema,
+        ))
+        print("num_frame_anchors: {}".format(args.num_frame_anchors))
+        print("lambda_frame: {}".format(args.lambda_frame))
+        print("num_anchor_inputs/lambda_anchor/anchor_ema: {}/{}/{}".format(
+            args.num_anchor_inputs,
+            args.lambda_anchor,
+            args.anchor_ema,
+        ))
+        print("frame_update period/start/alpha/max_shift: {}/{}/{}/{}".format(
+            args.frame_update_period,
+            args.frame_update_start,
+            args.frame_update_alpha,
+            args.frame_max_shift,
         ))
         print("shared_classifier_scale: {}".format(args.shared_classifier_scale))
-        print("anchor_center_weight: {}".format(args.anchor_center_weight))
        
     print("Local learing rate: {}".format(args.local_learning_rate))
     print("=" * 50)
