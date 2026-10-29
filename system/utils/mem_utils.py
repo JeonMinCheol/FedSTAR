@@ -8,21 +8,17 @@ import torch
 from math import isnan
 try:
     from calmsize import size as calmsize
-except ImportError:
-    calmsize = None
+except ModuleNotFoundError:
+    def calmsize(num_bytes):
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(num_bytes)
+        for unit in units:
+            if abs(value) < 1024.0 or unit == units[-1]:
+                return f"{value:.2f} {unit}"
+            value /= 1024.0
 
 def readable_size(num_bytes: int) -> str:
-    if isnan(num_bytes):
-        return ''
-    if calmsize is not None:
-        return '{:.2f}'.format(calmsize(num_bytes))
-    units = ("B", "KB", "MB", "GB", "TB")
-    value = float(num_bytes)
-    unit_idx = 0
-    while value >= 1024.0 and unit_idx < len(units) - 1:
-        value /= 1024.0
-        unit_idx += 1
-    return "{:.2f} {}".format(value, units[unit_idx])
+    return '' if isnan(num_bytes) else '{:.2f}'.format(calmsize(num_bytes))
 
 LEN = 79
 
