@@ -1,152 +1,81 @@
 import torch
 import os
 import numpy as np
-# import h5py
+import h5py
 import copy
 import time
 import random
-from torch.utils.data import DataLoader
-from sklearn import metrics
-
+import shutil
+import tempfile
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from utils.data_utils import read_client_data
-from utils.dlg import DLG
-from scipy.stats import entropy
-import csv
-from utils.wandb_utils import wandb_log
+from flcore.clients.clientbase import ModelStore, load_item, save_item
 
-def safe_auc(y_true, y_prob):
-    try:
-        return metrics.roc_auc_score(y_true, y_prob, average='micro')
-    except Exception:
-        return 0.0
-
-
-def safe_f1(y_true, y_pred):
-    try:
-        return metrics.f1_score(y_true, y_pred, average='macro')
-    except Exception:
-        return 0.0
-
-
-def brier_score(y_true, y_prob):
-    """Multi-class Brier score"""
-    try:
-        return np.mean(np.sum((y_prob - y_true) ** 2, axis=1))
-    except Exception:
-        return np.nan
-
-
-def multiclass_ece(y_true, y_prob, n_bins=10):
-    """
-    Top-label expected calibration error for multi-class classification.
-    y_true can be integer labels [N] or one-hot labels [N, C].
-    y_prob is expected to be class probabilities [N, C].
-    """
-    try:
-        y_prob = np.asarray(y_prob)
-        y_true = np.asarray(y_true)
-        if y_prob.ndim != 2 or y_prob.shape[0] == 0:
-            return 0.0
-
-        if y_true.ndim == 2:
-            y_true = np.argmax(y_true, axis=1)
-        else:
-            y_true = y_true.astype(np.int64)
-
-        confidences = np.max(y_prob, axis=1)
-        predictions = np.argmax(y_prob, axis=1)
-        correctness = (predictions == y_true).astype(np.float64)
-
-        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-        ece = 0.0
-        for bin_idx in range(n_bins):
-            left = bin_edges[bin_idx]
-            right = bin_edges[bin_idx + 1]
-            if bin_idx == 0:
-                mask = (confidences >= left) & (confidences <= right)
-            else:
-                mask = (confidences > left) & (confidences <= right)
-            if not np.any(mask):
-                continue
-            acc_bin = np.mean(correctness[mask])
-            conf_bin = np.mean(confidences[mask])
-            ece += (np.sum(mask) / len(confidences)) * abs(acc_bin - conf_bin)
-        return float(ece)
-    except Exception:
-        return 0.0
 
 class Server(object):
     def __init__(self, args, times):
         # Set up the main attributes
-        self.aggregation_times = []
-        self.aggregation_memories = []
-
-        self.max_parallel_clients = 8
         self.args = args
         self.device = args.device
+        storage_device = getattr(args, 'model_storage_device', 'cpu')
+        if storage_device == 'cuda':
+            if torch.device(self.device).type != 'cuda':
+                raise ValueError('--model_storage_device cuda requires --device cuda')
+            storage_device = self.device
         self.dataset = args.dataset
         self.num_classes = args.num_classes
         self.global_rounds = args.global_rounds
         self.local_epochs = args.local_epochs
         self.batch_size = args.batch_size
         self.learning_rate = args.local_learning_rate
-        self.global_model = copy.deepcopy(args.model)
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
         self.random_join_ratio = args.random_join_ratio
-        self.random_seed = int(getattr(args, "random_seed", 0))
         self.num_join_clients = int(self.num_clients * self.join_ratio)
         self.current_num_join_clients = self.num_join_clients
+        self.few_shot = args.few_shot
         self.algorithm = args.algorithm
         self.time_select = args.time_select
-        self.time_threthold = args.time_threthold
-        self.save_folder_name = args.save_folder_name
-        self.learning_rate_decay = args.learning_rate_decay
-        self.auto_break = args.auto_break
-        self.dirchlet = args.dirchlet
         self.goal = args.goal
-        self.top_cnt = 100
+        self.time_threthold = args.time_threthold
+        self.top_cnt = args.top_cnt
+        self.auto_break = args.auto_break
+        self.role = 'Server'
+        # Every repetition/process owns a fresh directory. Never reuse another
+        # run's prototypes, logits or server state, or delete a shared root.
+        checkpoint_root = Path(args.save_folder_name).resolve() / args.dataset / args.algorithm
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        self._checkpoint_run_dir = Path(tempfile.mkdtemp(prefix=f'run-{times}-', dir=checkpoint_root))
+        args.save_folder_name_full = str(self._checkpoint_run_dir)
+        self.save_folder_name = args.save_folder_name_full
+        self.keep_checkpoints = bool(getattr(args, 'keep_checkpoints', False))
+        self._model_store = ModelStore(self.save_folder_name, device=storage_device)
 
         self.clients = []
         self.selected_clients = []
         self.train_slow_clients = []
         self.send_slow_clients = []
-        self.Budget = []
 
         self.uploaded_weights = []
         self.uploaded_ids = []
-        self.uploaded_models = []
 
         self.rs_test_acc = []
         self.rs_test_auc = []
         self.rs_train_loss = []
-        self.rs_test_fscore = []
-        self.rs_test_ece = []
 
         self.times = times
-        self.start_time = time.time()
         self.eval_gap = args.eval_gap
         self.client_drop_rate = args.client_drop_rate
         self.train_slow_rate = args.train_slow_rate
         self.send_slow_rate = args.send_slow_rate
+        self.max_parallel_clients = max(1, int(getattr(args, "max_parallel_clients", 1)))
 
-        self.dlg_eval = args.dlg_eval
-        self.dlg_gap = args.dlg_gap
-        self.batch_num_per_client = args.batch_num_per_client
-
-        self.num_new_clients = args.num_new_clients
-        self.new_clients = []
-        self.eval_new_clients = False
-        self.fine_tuning_epoch = args.fine_tuning_epoch
-        self.current_round = 0
-
-        self.test_loader = self.set_test_data()
-        self.csv_dir = f"{args.dataset}/{str(args.dirchlet)}/{self.algorithm}_time_{str(self.start_time)}"
 
     def set_clients(self, clientObj):
         for i, train_slow, send_slow in zip(range(self.num_clients), self.train_slow_clients, self.send_slow_clients):
-            train_data = read_client_data(self.dataset, i, is_train=True, alpha=self.dirchlet)
-            test_data = read_client_data(self.dataset, i, is_train=False, alpha=self.dirchlet)
+            train_data = read_client_data(self.dataset, i, is_train=True, few_shot=self.few_shot)
+            test_data = read_client_data(self.dataset, i, is_train=False, few_shot=self.few_shot)
             client = clientObj(self.args, 
                             id=i, 
                             train_samples=len(train_data), 
@@ -154,14 +83,7 @@ class Server(object):
                             train_slow=train_slow, 
                             send_slow=send_slow)
             self.clients.append(client)
-            
-    def set_test_data(self):
-        test_data = []
-        for i in range(self.num_clients):
-            test_data.extend(read_client_data(self.dataset, i, is_train = False))
-            
-        return DataLoader(test_data, self.batch_size, drop_last=True, shuffle=True)
-        
+
     # random select slow clients
     def select_slow_clients(self, slow_rate):
         slow_clients = [False for i in range(self.num_clients)]
@@ -179,35 +101,35 @@ class Server(object):
             self.send_slow_rate)
 
     def select_clients(self):
-        rnd = np.random.RandomState(seed=self.random_seed + 42 + self.current_round)
-
         if self.random_join_ratio:
-            self.current_num_join_clients = rnd.choice(
-                range(self.num_join_clients, self.num_clients + 1), 1, replace=False
-            )[0]
+            self.current_num_join_clients = np.random.choice(range(self.num_join_clients, self.num_clients+1), 1, replace=False)[0]
         else:
             self.current_num_join_clients = self.num_join_clients
-
-        selected_clients = list(rnd.choice(
-            self.clients, self.current_num_join_clients, replace=False
-        ))
-
-        self.current_round += 1
+        selected_clients = list(np.random.choice(self.clients, self.current_num_join_clients, replace=False))
 
         return selected_clients
 
-    def send_models(self):
+    def train_selected_clients(self):
+        if self.max_parallel_clients <= 1 or len(self.selected_clients) <= 1:
+            for client in self.selected_clients:
+                client.train()
+            return
+
+        with ThreadPoolExecutor(max_workers=self.max_parallel_clients) as executor:
+            list(executor.map(lambda client: client.train(), self.selected_clients))
+
+    def send_parameters(self):
         assert (len(self.clients) > 0)
 
         for client in self.clients:
             start_time = time.time()
             
-            client.set_parameters(self.global_model)
+            client.set_parameters()
 
             client.send_time_cost['num_rounds'] += 1
             client.send_time_cost['total_cost'] += 2 * (time.time() - start_time)
 
-    def receive_models(self):
+    def receive_ids(self):
         assert (len(self.selected_clients) > 0)
 
         active_clients = random.sample(
@@ -215,96 +137,146 @@ class Server(object):
 
         self.uploaded_ids = []
         self.uploaded_weights = []
-        self.uploaded_models = []
         tot_samples = 0
         for client in active_clients:
-            try:
-                client_time_cost = client.train_time_cost['total_cost'] / client.train_time_cost['num_rounds'] + \
-                        client.send_time_cost['total_cost'] / client.send_time_cost['num_rounds']
-            except ZeroDivisionError:
-                client_time_cost = 0
-            if client_time_cost <= self.time_threthold:
-                tot_samples += client.train_samples
-                self.uploaded_ids.append(client.id)
-                self.uploaded_weights.append(client.train_samples)
-                self.uploaded_models.append(client.model)
+            tot_samples += client.train_samples
+            self.uploaded_ids.append(client.id)
+            self.uploaded_weights.append(client.train_samples)
         for i, w in enumerate(self.uploaded_weights):
             self.uploaded_weights[i] = w / tot_samples
 
     def aggregate_parameters(self):
-        assert (len(self.uploaded_models) > 0)
+        assert (len(self.uploaded_ids) > 0)
 
-        self.global_model = copy.deepcopy(self.uploaded_models[0])
-        for param in self.global_model.parameters():
+        client = self.clients[self.uploaded_ids[0]]
+        global_model = load_item(client.role, 'model', client.save_folder_name)
+        for param in global_model.parameters():
             param.data.zero_()
             
-        for w, client_model in zip(self.uploaded_weights, self.uploaded_models):
-            self.add_parameters(w, client_model)
+        for w, cid in zip(self.uploaded_weights, self.uploaded_ids):
+            client = self.clients[cid]
+            client_model = load_item(client.role, 'model', client.save_folder_name)
+            for server_param, client_param in zip(global_model.parameters(), client_model.parameters()):
+                server_param.data += client_param.data.clone() * w
 
-    def add_parameters(self, w, client_model):
-        for server_param, client_param in zip(self.global_model.parameters(), client_model.parameters()):
-            server_param.data += client_param.data.clone() * w
-
-    def save_global_model(self):
-        model_path = os.path.join("models",str(self.dirchlet),self.dataset)
-        if not os.path.exists(model_path):
-            os.makedirs(model_path)
-        model_path = os.path.join(model_path, self.algorithm + "_server" + ".pt")
-        torch.save(self.global_model, model_path)
-
-    def load_model(self):
-        model_path = os.path.join("models",str(self.dirchlet),self.dataset)
-        model_path = os.path.join(model_path, self.algorithm + "_server" + ".pt")
-        assert (os.path.exists(model_path))
-        self.global_model = torch.load(model_path)
-
-    def model_exists(self):
-        model_path = os.path.join("models", self.dataset)
-        model_path = os.path.join(model_path, self.algorithm + "_server" + ".pt")
-        return os.path.exists(model_path)
+        save_item(global_model, self.role, 'global_model', self.save_folder_name)
         
+    def result_data(self):
+        return {
+            'rs_test_acc': self.rs_test_acc,
+            'rs_test_auc': self.rs_test_auc,
+            'rs_train_loss': self.rs_train_loss,
+        }
+
     def save_results(self):
         algo = self.dataset + "_" + self.algorithm
-        result_path = "./results/"
+        result_path = str(Path(__file__).resolve().parents[2] / 'results') + os.sep
         if not os.path.exists(result_path):
             os.makedirs(result_path)
 
-        # if (len(self.rs_test_acc)):
-        #     algo = algo + "_" + str(self.dirchlet) + "_" + self.goal + "_" + str(self.times)
-        #     file_path = result_path + "{}.h5".format(algo)
-        #     print("File path: " + file_path)
+        if (len(self.rs_test_acc)):
+            algo = algo + "_" + self.goal + "_" + str(self.times)
+            file_path = result_path + "{}.h5".format(algo)
+            print("File path: " + file_path)
 
-        #     with h5py.File(file_path, 'w') as hf:
-        #         hf.create_dataset('rs_test_acc', data=self.rs_test_acc)
-        #         hf.create_dataset('rs_test_auc', data=self.rs_test_auc)
-        #         hf.create_dataset('rs_train_loss', data=self.rs_train_loss)
-        #         hf.create_dataset('rs_test_fscore', data=self.rs_test_fscore)
-        #         hf.create_dataset('rs_test_ece', data=self.rs_test_ece)
+            with h5py.File(file_path, 'w') as hf:
+                for name, values in self.result_data().items():
+                    hf.create_dataset(name, data=values)
+            # Subclass metrics must also be written and the HDF5 file closed
+            # successfully before deleting any checkpoints.
+            self.cleanup_checkpoints()
 
-    def save_item(self, item, item_name):
-        if not os.path.exists(self.save_folder_name):
-            os.makedirs(self.save_folder_name)
-        torch.save(item, os.path.join(self.save_folder_name, "server_" + item_name + ".pt"))
+    def cleanup_checkpoints(self):
+        if self.keep_checkpoints:
+            self._model_store.flush()
+            self._model_store.models.clear()
+            print(f'Checkpoints kept: {self.save_folder_name}')
+            return
+        directory = self._checkpoint_run_dir
+        if Path(self.save_folder_name) != directory or directory.is_symlink():
+            raise RuntimeError('Refusing to delete a checkpoint directory not owned by this run')
+        if directory.exists():
+            shutil.rmtree(directory)
+            print(f'Deleted run checkpoints: {directory}')
+        self._model_store.models.clear()
 
-    def load_item(self, item_name):
-        return torch.load(os.path.join(self.save_folder_name, "server_" + item_name + ".pt"))
+    def test_metrics(self):
+        num_samples = []
+        tot_correct = []
+        tot_auc = []
+        for c in self.clients:
+            ct, ns, auc = c.test_metrics()
+            tot_correct.append(ct*1.0)
+            print(f'Client {c.id}: Acc: {ct*1.0/ns}, AUC: {auc}')
+            tot_auc.append(auc*ns)
+            num_samples.append(ns)
+
+        ids = [c.id for c in self.clients]
+
+        return ids, num_samples, tot_correct, tot_auc
+
+    def train_metrics(self):
+        num_samples = []
+        losses = []
+        for c in self.clients:
+            cl, ns = c.train_metrics()
+            num_samples.append(ns)
+            losses.append(cl*1.0)
+            print(f'Client {c.id}: Loss: {cl*1.0/ns}')
+
+        ids = [c.id for c in self.clients]
+
+        return ids, num_samples, losses
+
+    # evaluate selected clients
+    def evaluate(self, acc=None, loss=None):
+        stats = self.test_metrics()
+        # stats_train = self.train_metrics()
+
+        test_acc = sum(stats[2])*1.0 / sum(stats[1])
+        test_auc = sum(stats[3])*1.0 / sum(stats[1])
+        # train_loss = sum(stats_train[2])*1.0 / sum(stats_train[1])
+        accs = [a / n for a, n in zip(stats[2], stats[1])]
+        aucs = [a / n for a, n in zip(stats[3], stats[1])]
+        
+        if acc == None:
+            self.rs_test_acc.append(test_acc)
+        else:
+            acc.append(test_acc)
+        
+        # if loss == None:
+        #     self.rs_train_loss.append(train_loss)
+        # else:
+        #     loss.append(train_loss)
+
+        # print("Averaged Train Loss: {:.4f}".format(train_loss))
+        print("Averaged Test Accuracy: {:.4f}".format(test_acc))
+        print("Averaged Test AUC: {:.4f}".format(test_auc))
+        # self.print_(test_acc, train_acc, train_loss)
+        print("Std Test Accuracy: {:.4f}".format(np.std(accs)))
+        print("Std Test AUC: {:.4f}".format(np.std(aucs)))
+
+    def print_(self, test_acc, test_auc, train_loss):
+        print("Average Test Accuracy: {:.4f}".format(test_acc))
+        print("Average Test AUC: {:.4f}".format(test_auc))
+        print("Average Train Loss: {:.4f}".format(train_loss))
 
     def check_done(self, acc_lss, top_cnt=None, div_value=None):
         for acc_ls in acc_lss:
-            if top_cnt != None and div_value != None:
+            if top_cnt is not None and div_value is not None:
                 find_top = len(acc_ls) - torch.topk(torch.tensor(acc_ls), 1).indices[0] > top_cnt
                 find_div = len(acc_ls) > 1 and np.std(acc_ls[-top_cnt:]) < div_value
                 if find_top and find_div:
                     pass
                 else:
                     return False
-            elif top_cnt != None:
+            elif top_cnt is not None:
                 find_top = len(acc_ls) - torch.topk(torch.tensor(acc_ls), 1).indices[0] > top_cnt
                 if find_top:
                     pass
                 else:
                     return False
-            elif div_value != None:
+            elif div_value is not None:
                 find_div = len(acc_ls) > 1 and np.std(acc_ls[-top_cnt:]) < div_value
                 if find_div:
                     pass
@@ -313,365 +285,3 @@ class Server(object):
             else:
                 raise NotImplementedError
         return True
-
-    def call_dlg(self, R):
-        # items = []
-        cnt = 0
-        psnr_val = 0
-        for cid, client_model in zip(self.uploaded_ids, self.uploaded_models):
-            client_model.eval()
-            origin_grad = []
-            for gp, pp in zip(self.global_model.parameters(), client_model.parameters()):
-                origin_grad.append(gp.data - pp.data)
-
-            target_inputs = []
-            trainloader = self.clients[cid].load_train_data()
-            with torch.no_grad():
-                for i, (x, y) in enumerate(trainloader):
-                    if i >= self.batch_num_per_client:
-                        break
-
-                    if type(x) == type([]):
-                        x[0] = x[0].to(self.device)
-                    else:
-                        x = x.to(self.device)
-                    y = y.to(self.device)
-                    output = client_model(x)
-                    target_inputs.append((x, output))
-
-            d = DLG(client_model, origin_grad, target_inputs)
-            if d is not None:
-                psnr_val += d
-                cnt += 1
-            
-            # items.append((client_model, origin_grad, target_inputs))
-                
-        if cnt > 0:
-            print('PSNR value is {:.2f} dB'.format(psnr_val / cnt))
-        else:
-            print('PSNR error')
-
-        # self.save_item(items, f'DLG_{R}')
-
-    def set_new_clients(self, clientObj):
-        for i in range(self.num_clients, self.num_clients + self.num_new_clients):
-            train_data = read_client_data(self.dataset, i, is_train=True)
-            test_data = read_client_data(self.dataset, i, is_train=False)
-            client = clientObj(self.args, 
-                            id=i, 
-                            train_samples=len(train_data), 
-                            test_samples=len(test_data), 
-                            train_slow=False, 
-                            send_slow=False)
-            self.new_clients.append(client)
-
-    # fine-tuning on new clients
-    def fine_tuning_new_clients(self):
-        for client in self.new_clients:
-            client.set_parameters(self.global_model)
-            opt = torch.optim.SGD(client.model.parameters(), lr=self.learning_rate)
-            CEloss = torch.nn.CrossEntropyLoss()
-            trainloader = client.load_train_data()
-            client.model.train()
-            for e in range(self.fine_tuning_epoch):
-                for i, (x, y) in enumerate(trainloader):
-                    if type(x) == type([]):
-                        x[0] = x[0].to(client.device)
-                    else:
-                        x = x.to(client.device)
-                    y = y.to(client.device)
-                    output = client.model(x)
-                    loss = CEloss(output, y)
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-
-    # evaluating on new clients
-    def test_metrics_new_clients(self):
-        pass
-
-    def _weighted_debug_summary(self, weighted_debug_items):
-        if len(weighted_debug_items) == 0:
-            return {}
-
-        keys = sorted({
-            key
-            for _, debug in weighted_debug_items
-            for key in getattr(debug, "keys", lambda: [])()
-        })
-        summary = {}
-        for key in keys:
-            weight_sum = 0.0
-            value_sum = 0.0
-            for weight, debug in weighted_debug_items:
-                if key not in debug:
-                    continue
-                weight_f = float(weight)
-                value_sum += weight_f * float(debug.get(key, 0.0))
-                weight_sum += weight_f
-            if weight_sum > 0:
-                summary[key] = value_sum / weight_sum
-        return summary
-
-    def test_metrics(self, test_loader=None):
-        if getattr(self, "eval_new_clients", False) and getattr(self, "num_new_clients", 0) > 0:
-            self.fine_tuning_new_clients()
-            return self.test_metrics_new_clients()
-
-        all_y_prob, all_y_true = [], []
-        client_aucs, client_accs, client_fscores, client_eces = [], [], [], []
-        eval_debug_items = []
-
-        global_num = 0
-        global_correct = 0
-
-        for c in self.clients:
-            result = c.test_metrics(test_loader)
-            if not result or len(result) < 4:
-                continue
-            correct_c, num_c, y_prob_c, y_true_c = result
-            if num_c <= 1e-5:
-                continue
-
-            client_debug = getattr(c, "latest_eval_debug", {})
-            if client_debug:
-                eval_debug_items.append((float(num_c), client_debug))
-
-            y_true_c = np.asarray(y_true_c)
-            y_prob_c = np.asarray(y_prob_c)
-            acc_i = float(correct_c) / float(num_c)
-            client_accs.append(acc_i)
-
-            global_correct += correct_c
-            global_num += num_c
-
-            auc_i = safe_auc(y_true_c, y_prob_c)
-            y_pred_c = np.argmax(y_prob_c, axis=1)
-            y_true_label = np.argmax(y_true_c, axis=1)
-            f1_i = safe_f1(y_true_label, y_pred_c)
-            ece_i = multiclass_ece(y_true_label, y_prob_c)
-
-            client_aucs.append(auc_i)
-            client_fscores.append(f1_i)
-            client_eces.append(ece_i)
-            all_y_true.append(y_true_c)
-            all_y_prob.append(y_prob_c)
-
-        if len(all_y_true) == 0:
-            return [0.0] * 8
-
-        all_y_true = np.concatenate(all_y_true, axis=0)
-        all_y_prob = np.concatenate(all_y_prob, axis=0)
-        y_pred_all = np.argmax(all_y_prob, axis=1)
-        y_true_all = np.argmax(all_y_true, axis=1)
-
-        acc_std = float(np.std(client_accs)) if client_accs else 0.0
-        auc_std = float(np.std(client_aucs)) if client_aucs else 0.0
-        f1_std = float(np.std(client_fscores)) if client_fscores else 0.0
-        ece_std = float(np.std(client_eces)) if client_eces else 0.0
-        global_acc = global_correct / max(global_num, 1)
-        global_auc = safe_auc(all_y_true, all_y_prob)
-        global_fscore = safe_f1(y_true_all, y_pred_all)
-        global_ece_mean = multiclass_ece(y_true_all, all_y_prob)
-
-        # --- 추가 metric ---
-        global_brier = brier_score(all_y_true, all_y_prob)
-        global_entropy = float(np.mean(entropy(all_y_prob.T)))  # 평균 불확실성
-
-        # --- Class-wise metrics ---
-        precision, recall, f1_cls, _ = metrics.precision_recall_fscore_support(
-            y_true_all, y_pred_all, average=None, zero_division=0
-        )
-
-        cm = metrics.confusion_matrix(y_true_all, y_pred_all, normalize="true")
-
-        # 저장용 dict
-        self.analysis_dict = {
-            "confusion_matrix": cm,
-            "precision": precision,
-            "recall": recall,
-            "f1_class": f1_cls,
-            "brier_score": global_brier,
-            "entropy": global_entropy,
-        }
-        self.eval_debug_summary = self._weighted_debug_summary(eval_debug_items)
-
-        return (global_acc, global_auc, global_fscore, global_ece_mean,
-                acc_std, auc_std, f1_std, ece_std)
-
-    # ------------------------------------------------------------
-    def _print(self, train_loss, train_acc, test_acc, test_auc, test_fscore,
-               test_ece, acc_std, auc_std, f1_std, ece_std):
-        if train_loss is not None:
-            print("Averaged Train Loss: {:.4f}".format(train_loss))
-            print("Averaged Train acc: {:.4f}".format(train_acc))
-        if test_acc is not None:
-            print("Averaged Test Accuracy: {:.4f}".format(test_acc))
-            print("Averaged Test AUC: {:.4f}".format(test_auc))
-            print("Averaged Test F1: {:.4f}".format(test_fscore))
-            print("Averaged Test ECE: {:.4f}".format(test_ece))
-        if train_acc is not None and test_acc is not None:
-            print("Generalization Gap: {:.4f}".format(train_acc - test_acc))
-
-        # 추가 요약
-        if hasattr(self, "analysis_dict"):
-            a = self.analysis_dict
-            print(f"Brier Score: {a['brier_score']:.4f} | Mean Entropy: {a['entropy']:.4f}")
-            print(f"Per-class F1 mean: {np.mean(a['f1_class']):.4f}")
-
-    def train_metrics(self):
-        if self.eval_new_clients and self.num_new_clients > 0:
-            return [0], [1], [0], [0]
-        
-        num_samples = []
-        losses = []
-        accuracies = []
-        train_debug_items = []
-        for c in self.clients:
-            ls, ns, tc = c.train_metrics()
-            num_samples.append(ns)
-            losses.append(ls*1.0)
-            accuracies.append(tc*1.0)
-            client_debug = getattr(c, "latest_train_eval_debug", {})
-            if client_debug:
-                train_debug_items.append((float(ns), client_debug))
-
-        ids = [c.id for c in self.clients]
-        self.train_eval_debug_summary = self._weighted_debug_summary(train_debug_items)
-
-        return ids, num_samples, losses, accuracies
-
-    def evaluate(self, rnd, acc_list=None, loss_list=None):
-        (test_acc, test_auc, test_fscore, test_ece,
-        acc_std, auc_std, f1_std, ece_std) = self.test_metrics()
-
-        stats_train = self.train_metrics()
-        train_loss = sum(stats_train[2]) / sum(stats_train[1])
-        train_acc = sum(stats_train[3]) / sum(stats_train[1])
-
-        # --- 2. 결과 폴더 ---
-        os.makedirs("./results", exist_ok=True)
-        csv_path = f"./results/{self.csv_dir}.csv"
-
-        # --- 3. CSV 헤더 (한 번만 생성) ---
-        header = [
-            "round","train_loss","train_acc","test_acc","test_auc","test_fscore","test_ece",
-            "generalization_gap",
-            "precision_mean",
-            "recall_mean",
-            "f1_class_mean",
-            "brier_score","entropy"
-        ]
-        
-        file_exists = os.path.isfile(csv_path)
-        if not file_exists:
-            with open(csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-
-        # --- 4. 분석 데이터 ---
-        a = self.analysis_dict
-        precision = a.get("precision", np.zeros(1))
-        recall = a.get("recall", np.zeros(1))
-        f1_class = a.get("f1_class", np.zeros(1))
-        brier = a.get("brier_score", 0.0)
-        entropy_v = a.get("entropy", 0.0)
-
-        # --- 5. 한 줄 데이터 ---
-        row = [
-            rnd,
-            f"{train_loss:.4f}", f"{train_acc:.4f}",
-            f"{test_acc:.4f}", f"{test_auc:.4f}", f"{test_fscore:.4f}", f"{test_ece:.4f}",
-            f"{(train_acc - test_acc):.4f}",
-            f"{np.mean(precision):.4f}",
-            f"{np.mean(recall):.4f}",
-            f"{np.mean(f1_class):.4f}",
-            f"{float(brier):.4f}", f"{float(entropy_v):.4f}",
-        ]
-
-        # --- 6. append 모드로 바로 추가 ---
-        with open(csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
-
-        eval_payload = {
-                "eval/train_loss": float(train_loss),
-                "eval/train_acc": float(train_acc),
-                "eval/test_acc": float(test_acc),
-                "eval/test_auc": float(test_auc),
-                "eval/test_f1": float(test_fscore),
-                "eval/test_ece": float(test_ece),
-                "eval/generalization_gap": float(train_acc - test_acc),
-                "eval/acc_std": float(acc_std),
-                "eval/auc_std": float(auc_std),
-                "eval/f1_std": float(f1_std),
-                "eval/ece_std": float(ece_std),
-                "eval/precision_mean": float(np.mean(precision)),
-                "eval/recall_mean": float(np.mean(recall)),
-                "eval/f1_class_mean": float(np.mean(f1_class)),
-                "eval/brier_score": float(brier),
-                "eval/entropy": float(entropy_v),
-                f"{str(self.algorithm).lower()}/loss/eval_train": float(train_loss),
-        }
-        diagnostic_metrics = {}
-        eval_debug_summary = getattr(self, "eval_debug_summary", {})
-        train_debug_summary = getattr(self, "train_eval_debug_summary", {})
-        for key, value in eval_debug_summary.items():
-            diagnostic_metrics[f"{str(self.algorithm).lower()}/diag/eval/{key}"] = float(value)
-        for key, value in train_debug_summary.items():
-            diagnostic_metrics[f"{str(self.algorithm).lower()}/diag/train/{key}"] = float(value)
-        if eval_debug_summary and train_debug_summary:
-            algo_key = str(self.algorithm).lower()
-            if "train_eval_acc" in train_debug_summary and "eval_acc" in eval_debug_summary:
-                diagnostic_metrics[f"{algo_key}/diag/gap/acc"] = float(
-                    train_debug_summary.get("train_eval_acc", 0.0)
-                    - eval_debug_summary.get("eval_acc", 0.0)
-                )
-            if "train_eval_frame_fit" in train_debug_summary and "eval_frame_fit" in eval_debug_summary:
-                diagnostic_metrics[f"{algo_key}/diag/gap/frame_fit"] = float(
-                    train_debug_summary.get("train_eval_frame_fit", 0.0)
-                    - eval_debug_summary.get("eval_frame_fit", 0.0)
-                )
-        eval_payload.update(diagnostic_metrics)
-        wandb_log(
-            eval_payload,
-            step=rnd,
-        )
-
-        # --- 7. 콘솔 출력 ---
-        self._print(train_loss, train_acc, test_acc, test_auc, test_fscore,
-                    test_ece, acc_std, auc_std, f1_std, ece_std)
-        eval_debug = getattr(self, "eval_debug_summary", {})
-        train_debug = getattr(self, "train_eval_debug_summary", {})
-        if eval_debug:
-            eval_frame = eval_debug.get("eval_frame_fit", None)
-            eval_frame_text = "" if eval_frame is None else f" | frame_fit={float(eval_frame):.4f}"
-            print(
-                "FedSTAR EvalDiag "
-                f"acc={eval_debug.get('eval_acc', 0.0):.4f}"
-                f"{eval_frame_text}"
-            )
-        if train_debug:
-            train_frame = train_debug.get("train_eval_frame_fit", None)
-            train_frame_text = "" if train_frame is None else f" | frame_fit={float(train_frame):.4f}"
-            print(
-                "FedSTAR TrainDiag "
-                f"acc={train_debug.get('train_eval_acc', 0.0):.4f}"
-                f"{train_frame_text}"
-            )
-        if eval_debug and train_debug:
-            acc_gap = train_debug.get("train_eval_acc", 0.0) - eval_debug.get("eval_acc", 0.0)
-            frame_gap_text = ""
-            if "train_eval_frame_fit" in train_debug and "eval_frame_fit" in eval_debug:
-                frame_gap = train_debug.get("train_eval_frame_fit", 0.0) - eval_debug.get("eval_frame_fit", 0.0)
-                frame_gap_text = f" | frame_fit={float(frame_gap):.4f}"
-            print(
-                "FedSTAR GapDiag "
-                f"acc={float(acc_gap):.4f}"
-                f"{frame_gap_text}"
-            )
-
-        return (
-            train_loss, train_acc, test_acc, test_auc, test_fscore,
-            test_ece, acc_std, auc_std, f1_std, ece_std
-        )
